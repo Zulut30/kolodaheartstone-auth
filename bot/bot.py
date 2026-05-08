@@ -2,9 +2,10 @@
 Telegram bot for kolodahearthstone.ru VIP content unlock.
 
 UI:
-  /start          welcome card with brand intro and a single CTA
-  /catalog        card-style article browser (1 article per screen)
-  Navigation      ◀ / ▶ between articles, "Получить доступ" issues link
+  /start            welcome card (with first article cover) + CTAs
+  /catalog          card-style article browser (1 article per screen)
+  Navigation        ◀ / ▶ between articles, "Получить доступ" issues link
+  Subscription      "I subscribed" callback re-checks membership
 
 Flow:
   membership in CHANNEL_ID or GROUP_ID -> /lockers from WP -> on tap,
@@ -15,6 +16,7 @@ import html
 import logging
 import os
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -48,7 +50,9 @@ GROUP_ID = int(env("GROUP_ID"))
 SUBSCRIBE_LINKS = env("SUBSCRIBE_LINKS", "", required=False)
 HTTP_TIMEOUT = float(env("HTTP_TIMEOUT", "10", required=False))
 
-CAPTION_LIMIT = 1024  # Telegram photo caption hard limit
+CAPTION_LIMIT = 1024     # Telegram photo caption hard limit
+SUB_CACHE_TTL = 60.0     # seconds — how long to trust a positive/negative subscription check
+LOCKERS_CACHE_TTL = 300  # seconds — auto-refresh /lockers in background
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +63,9 @@ log = logging.getLogger("vipbot")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-USER_LOCKERS: dict[int, list[dict[str, Any]]] = {}
+# Per-user state
+USER_LOCKERS: dict[int, tuple[list[dict[str, Any]], float]] = {}
+SUB_CACHE: dict[int, tuple[bool, float]] = {}
 
 ALLOWED_STATUSES = {"member", "administrator", "creator"}
 
@@ -68,7 +74,14 @@ ALLOWED_STATUSES = {"member", "administrator", "creator"}
 #  WordPress / Telegram helpers
 # =====================================================
 
-async def is_subscribed(user_id: int) -> bool:
+async def is_subscribed(user_id: int, *, force: bool = False) -> bool:
+    now = time.monotonic()
+    if not force:
+        cached = SUB_CACHE.get(user_id)
+        if cached and (now - cached[1]) < SUB_CACHE_TTL:
+            return cached[0]
+
+    result = False
     for chat_id in (CHANNEL_ID, GROUP_ID):
         try:
             m = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
@@ -77,10 +90,14 @@ async def is_subscribed(user_id: int) -> bool:
             continue
         status = m.status
         if status in ALLOWED_STATUSES:
-            return True
+            result = True
+            break
         if status == "restricted" and getattr(m, "is_member", False):
-            return True
-    return False
+            result = True
+            break
+
+    SUB_CACHE[user_id] = (result, now)
+    return result
 
 
 async def wp_get(path: str) -> Any:
@@ -105,29 +122,72 @@ async def wp_post(path: str, payload: dict) -> Any:
 
 
 async def load_lockers(user_id: int, *, force: bool = False) -> list[dict[str, Any]]:
-    if not force and user_id in USER_LOCKERS:
-        return USER_LOCKERS[user_id]
+    now = time.monotonic()
+    if not force:
+        cached = USER_LOCKERS.get(user_id)
+        if cached and (now - cached[1]) < LOCKERS_CACHE_TTL:
+            return cached[0]
     data = await wp_get("/wp-json/vip/v1/lockers")
     if not isinstance(data, list):
         data = []
-    USER_LOCKERS[user_id] = data
+    USER_LOCKERS[user_id] = (data, now)
     return data
 
 
 # =====================================================
-#  UI builders
+#  Static UI strings
 # =====================================================
 
 WELCOME_TEXT = (
     "✨ <b>VIP-доступ Колоды Hearthstone</b>\n\n"
-    "Этот бот выдаёт одноразовые ссылки разблокировки статей "
-    "сайта <a href=\"https://kolodahearthstone.ru\">kolodahearthstone.ru</a> "
+    "Этот бот выдаёт одноразовые ссылки разблокировки статей сайта "
+    "<a href=\"https://kolodahearthstone.ru\">kolodahearthstone.ru</a> "
     "для подписчиков канала и группы.\n\n"
     "🃏 Выбираете статью\n"
     "🔓 Получаете персональную ссылку\n"
-    "💎 Открываете контент в браузере — доступ сохраняется на 7 дней"
+    "💎 Открываете в браузере — доступ сохраняется на 7 дней"
 )
 
+HELP_TEXT = (
+    "<b>Как это работает</b>\n\n"
+    "1. Бот проверяет вашу подписку на канал и группу.\n"
+    "2. Вы выбираете статью в каталоге — бот выдаёт одноразовую ссылку.\n"
+    "3. Открываете её <i>в обычном браузере</i> — ссылка автоматически разблокирует контент и сжигается.\n"
+    "4. Доступ к статье сохраняется в браузере на 7 дней.\n\n"
+    "<b>⚠️ Важно</b>\n"
+    "Открывайте ссылку в системном браузере (Safari, Chrome, Edge), а не во встроенном Telegram-просмотрщике — "
+    "иначе cookie разблокировки сохранится только в нём.\n\n"
+    "<b>Команды</b>\n"
+    "/start — главное меню\n"
+    "/catalog — каталог статей\n"
+    "/help — эта справка"
+)
+
+
+def parse_subscribe_links() -> list[tuple[str, str]]:
+    """Each entry is either 'Name|URL' or just 'URL'."""
+    items: list[tuple[str, str]] = []
+    for entry in SUBSCRIBE_LINKS.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "|" in entry:
+            name, _, url = entry.partition("|")
+            name, url = name.strip(), url.strip()
+        else:
+            url = entry
+            name = "Подписаться"
+        if url:
+            items.append((name, url))
+    return items
+
+
+SUBSCRIBE_BUTTONS = parse_subscribe_links()
+
+
+# =====================================================
+#  Welcome / subscribe screens
+# =====================================================
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -136,35 +196,70 @@ def welcome_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def build_subscribe_text() -> str:
+async def send_welcome_screen(msg: Message, user_id: int) -> None:
+    cover_url = ""
+    try:
+        lockers = await load_lockers(user_id)
+        for l in lockers:
+            if l.get("image"):
+                cover_url = l["image"]
+                break
+    except Exception:
+        log.exception("welcome: lockers prefetch failed; falling back to text")
+
+    kb = welcome_keyboard()
+    if cover_url:
+        try:
+            await msg.answer_photo(cover_url, caption=WELCOME_TEXT, reply_markup=kb)
+            return
+        except TelegramBadRequest as e:
+            log.warning("welcome cover failed (%s); falling back to text", e.message)
+
+    await msg.answer(WELCOME_TEXT, reply_markup=kb, disable_web_page_preview=True)
+
+
+async def send_subscribe_screen(msg: Message) -> None:
     text = (
         "🔒 <b>Доступ только для подписчиков</b>\n\n"
         "Чтобы получить VIP-ссылки, вступите в наш канал или группу. "
-        "Затем нажмите /start ещё раз."
+        "Затем нажмите <b>«Я подписался»</b> — проверим заново."
     )
-    if SUBSCRIBE_LINKS:
-        items = [x.strip() for x in SUBSCRIBE_LINKS.split(",") if x.strip()]
-        if items:
-            text += "\n\n" + "\n".join(f"• {x}" for x in items)
-    return text
+    rows: list[list[InlineKeyboardButton]] = []
+    for name, url in SUBSCRIBE_BUTTONS:
+        rows.append([InlineKeyboardButton(text=f"➡️ {name}", url=url)])
+    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
+    await msg.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        disable_web_page_preview=True,
+    )
+
+
+# =====================================================
+#  Catalog cards
+# =====================================================
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
 
 
 def card_caption(item: dict[str, Any], idx: int, total: int) -> str:
-    title = (item.get("title") or "(без названия)").strip()
+    title = _truncate((item.get("title") or "(без названия)").strip(), 200)
     excerpt = (item.get("excerpt") or "").strip()
 
-    head = f"<b>{html.escape(title)}</b>\n<i>📖 Статья {idx + 1} из {total}</i>"
+    head_plain = f"{title}\n📖 Статья {idx + 1} из {total}"
+    head_html = f"<b>{html.escape(title)}</b>\n<i>📖 Статья {idx + 1} из {total}</i>"
+
     if not excerpt:
-        return head
+        return head_html
 
-    body = html.escape(excerpt)
-    text = f"{head}\n\n{body}"
-    if len(text) <= CAPTION_LIMIT:
-        return text
+    # Truncate raw excerpt before escaping so we never split a HTML entity.
+    body_budget = max(0, CAPTION_LIMIT - len(head_plain) - 50)  # safety margin for entity expansion
+    excerpt = _truncate(excerpt, body_budget)
 
-    overflow = len(text) - CAPTION_LIMIT + 1
-    body = body[: max(0, len(body) - overflow)].rstrip() + "…"
-    return f"{head}\n\n{body}"
+    return f"{head_html}\n\n{html.escape(excerpt)}"
 
 
 def card_keyboard(idx: int, total: int) -> InlineKeyboardMarkup:
@@ -184,10 +279,9 @@ def card_keyboard(idx: int, total: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# =====================================================
-#  Card rendering: edit existing message in place when we can,
-#  otherwise delete and post a fresh one.
-# =====================================================
+def _is_not_modified(err: TelegramBadRequest) -> bool:
+    return "not modified" in (err.message or "").lower()
+
 
 async def render_card(
     msg: Message,
@@ -212,6 +306,8 @@ async def render_card(
                 await msg.edit_text(caption, reply_markup=kb, disable_web_page_preview=True)
             return
         except TelegramBadRequest as e:
+            if _is_not_modified(e):
+                return
             log.info("edit fallback (%s); sending fresh card", e.message)
             try:
                 await msg.delete()
@@ -237,44 +333,50 @@ async def cmd_start(msg: Message) -> None:
     user_id = msg.from_user.id
     log.info("/start user=%s", user_id)
     if not await is_subscribed(user_id):
-        await msg.answer(build_subscribe_text(), disable_web_page_preview=True)
+        await send_subscribe_screen(msg)
         return
-    await msg.answer(WELCOME_TEXT, reply_markup=welcome_keyboard(), disable_web_page_preview=True)
+    await send_welcome_screen(msg, user_id)
 
 
 @dp.message(Command("catalog"))
 async def cmd_catalog(msg: Message) -> None:
     if not await is_subscribed(msg.from_user.id):
-        await msg.answer(build_subscribe_text(), disable_web_page_preview=True)
+        await send_subscribe_screen(msg)
         return
     await open_catalog(msg, msg.from_user.id, idx=0, edit_message=None)
 
 
 @dp.message(Command("help"))
 async def cmd_help(msg: Message) -> None:
-    await msg.answer(
-        "<b>Как это работает</b>\n\n"
-        "1. Бот проверяет вашу подписку на канал/группу.\n"
-        "2. Вы выбираете статью в каталоге — бот выдаёт одноразовую ссылку.\n"
-        "3. Открываете её в браузере — ссылка автоматически разблокирует контент и «сжигается».\n"
-        "4. Доступ сохраняется в браузере на 7 дней.\n\n"
-        "<b>Команды</b>\n"
-        "/start — главное меню\n"
-        "/catalog — каталог статей\n"
-        "/help — эта справка",
-        disable_web_page_preview=True,
-    )
+    await msg.answer(HELP_TEXT, disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data == "help")
 async def cb_help(q: CallbackQuery) -> None:
-    await cmd_help(q.message)
     await q.answer()
+    await q.message.answer(HELP_TEXT, disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data == "noop")
 async def cb_noop(q: CallbackQuery) -> None:
     await q.answer()
+
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(q: CallbackQuery) -> None:
+    SUB_CACHE.pop(q.from_user.id, None)
+    if await is_subscribed(q.from_user.id, force=True):
+        await q.answer("✅ Подписка подтверждена", show_alert=False)
+        try:
+            await q.message.delete()
+        except TelegramBadRequest:
+            pass
+        await send_welcome_screen(q.message, q.from_user.id)
+    else:
+        await q.answer(
+            "Не вижу вашу подписку. Подпишитесь и попробуйте ещё раз через 10–20 секунд.",
+            show_alert=True,
+        )
 
 
 @dp.callback_query(F.data == "refresh")
@@ -297,8 +399,8 @@ async def cb_catalog(q: CallbackQuery) -> None:
     except ValueError:
         await q.answer("Неверный шаг.", show_alert=True)
         return
-    await open_catalog(q.message, q.from_user.id, idx=idx, edit_message=q.message)
     await q.answer()
+    await open_catalog(q.message, q.from_user.id, idx=idx, edit_message=q.message)
 
 
 async def open_catalog(
@@ -312,15 +414,19 @@ async def open_catalog(
         lockers = await load_lockers(user_id)
     except httpx.HTTPStatusError as e:
         log.error("lockers HTTP %s: %s", e.response.status_code, e.response.text[:300])
-        await msg.answer(f"Не удалось загрузить каталог: HTTP {e.response.status_code}")
+        await msg.answer(f"⚠️ Сервер вернул HTTP {e.response.status_code}. Попробуйте позже.")
         return
-    except Exception as e:
+    except Exception:
         log.exception("lockers failed")
-        await msg.answer(f"Не удалось загрузить каталог: {e}")
+        await msg.answer("⚠️ Не удалось загрузить каталог. Попробуйте позже.")
         return
 
     if not lockers:
-        await msg.answer("📭 Пока нет VIP-статей. Попробуйте позже.")
+        await msg.answer(
+            "📭 Пока нет VIP-статей.\n"
+            "Загляните позже — авторы публикуют новые материалы регулярно.",
+            disable_web_page_preview=True,
+        )
         return
 
     idx = max(0, min(len(lockers) - 1, idx))
@@ -343,7 +449,8 @@ async def cb_article(q: CallbackQuery) -> None:
         await q.answer("Неверный выбор.", show_alert=True)
         return
 
-    lockers = USER_LOCKERS.get(q.from_user.id) or []
+    cached = USER_LOCKERS.get(q.from_user.id)
+    lockers = cached[0] if cached else []
     if idx < 0 or idx >= len(lockers):
         await q.answer("Каталог устарел, нажмите /catalog.", show_alert=True)
         return
@@ -366,11 +473,16 @@ async def cb_article(q: CallbackQuery) -> None:
         )
     except httpx.HTTPStatusError as e:
         log.error("issue HTTP %s: %s", e.response.status_code, e.response.text[:300])
-        await q.message.answer(f"Не удалось выдать ссылку: HTTP {e.response.status_code}")
+        if e.response.status_code in (401, 503):
+            await q.message.answer("⚠️ Сервер не принял авторизацию бота. Сообщите админу.")
+        else:
+            await q.message.answer(
+                f"⚠️ Не удалось выдать ссылку (код {e.response.status_code}). Попробуйте позже."
+            )
         return
-    except Exception as e:
+    except Exception:
         log.exception("issue failed")
-        await q.message.answer(f"Не удалось выдать ссылку: {e}")
+        await q.message.answer("⚠️ Не удалось выдать ссылку. Попробуйте позже.")
         return
 
     url = res.get("url")
@@ -383,17 +495,21 @@ async def cb_article(q: CallbackQuery) -> None:
         return
 
     open_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Открыть статью", url=url)],
+        [InlineKeyboardButton(text="🌐 Открыть в браузере", url=url)],
         [InlineKeyboardButton(text="📚 Назад в каталог", callback_data=f"catalog:{idx}")],
     ])
 
-    await q.message.answer(
+    text = (
         f"🔓 <b>{html.escape(title)}</b>\n\n"
-        f"Ссылка одноразовая и действует <b>{minutes} мин</b>.\n"
-        f"После открытия доступ к статье сохранится в браузере на 7 дней.",
-        reply_markup=open_kb,
-        disable_web_page_preview=True,
+        f"⏱ Действует <b>{minutes} мин</b> · одноразовая\n"
+        f"💎 После активации доступ сохранится в браузере на 7 дней\n\n"
+        f"<b>Ссылка</b> (нажмите, чтобы скопировать):\n"
+        f"<code>{html.escape(url)}</code>\n\n"
+        f"<i>💡 Откройте её в обычном браузере (Safari, Chrome, Edge). "
+        f"Если открыть встроенным просмотрщиком Telegram — cookie сохранится только в нём.</i>"
     )
+
+    await q.message.answer(text, reply_markup=open_kb, disable_web_page_preview=True)
 
 
 # =====================================================

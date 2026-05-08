@@ -141,6 +141,7 @@ function svl_bot_make_excerpt($post) {
     } else {
         $raw = wp_strip_all_tags($raw);
     }
+    $raw = html_entity_decode((string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
     $raw = preg_replace('/\s+/u', ' ', $raw);
     $raw = trim((string) $raw);
     if (function_exists('mb_strlen') && mb_strlen($raw) > 600) {
