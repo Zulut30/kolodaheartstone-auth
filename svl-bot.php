@@ -92,6 +92,11 @@ function svl_bot_collect_lockers() {
     $seen = array();
     foreach ($rows as $r) {
         $codes = svl_bot_extract_codes($r->post_content, $default_code);
+        if (empty($codes)) continue;
+
+        $image = svl_bot_pick_image($r);
+        $excerpt = svl_bot_make_excerpt($r);
+
         foreach ($codes as $code) {
             $key = $r->ID . '|' . $code;
             if (isset($seen[$key])) continue;
@@ -101,12 +106,49 @@ function svl_bot_collect_lockers() {
                 'code'    => $code,
                 'title'   => html_entity_decode(get_the_title($r->ID), ENT_QUOTES, 'UTF-8'),
                 'url'     => get_permalink($r->ID),
+                'image'   => $image,
+                'excerpt' => $excerpt,
                 'date'    => $r->post_date,
                 'type'    => $r->post_type,
             );
         }
     }
     return $out;
+}
+
+/**
+ * Returns a public image URL for the post: featured image -> first <img> in
+ * content -> empty string. The 'large' size keeps Telegram captions snappy.
+ */
+function svl_bot_pick_image($post) {
+    $url = get_the_post_thumbnail_url($post->ID, 'large');
+    if ($url) return (string) $url;
+    if (preg_match('/<img[^>]+src=(["\'])([^"\']+)\1/i', $post->post_content, $im)) {
+        return (string) $im[2];
+    }
+    return '';
+}
+
+/**
+ * Builds a short plain-text excerpt: explicit post_excerpt -> stripped
+ * shortcodes/HTML from post_content, capped at ~600 chars.
+ */
+function svl_bot_make_excerpt($post) {
+    $raw = trim((string) $post->post_excerpt);
+    if ($raw === '') {
+        $raw = strip_shortcodes((string) $post->post_content);
+        $raw = wp_strip_all_tags($raw);
+    } else {
+        $raw = wp_strip_all_tags($raw);
+    }
+    $raw = preg_replace('/\s+/u', ' ', $raw);
+    $raw = trim((string) $raw);
+    if (function_exists('mb_strlen') && mb_strlen($raw) > 600) {
+        $raw = rtrim(mb_substr($raw, 0, 599)) . '…';
+    } elseif (strlen($raw) > 600) {
+        $raw = rtrim(substr($raw, 0, 599)) . '…';
+    }
+    return $raw;
 }
 
 function svl_bot_extract_codes($content, $default_code) {
