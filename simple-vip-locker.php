@@ -24,6 +24,7 @@ require_once __DIR__ . '/svl-pro.php';
 require_once __DIR__ . '/svl-geo.php';
 require_once __DIR__ . '/svl-magic.php';
 require_once __DIR__ . '/svl-block.php';
+require_once __DIR__ . '/svl-bot.php';
 
 register_activation_hook(__FILE__, 'svl_activate');
 function svl_activate() {

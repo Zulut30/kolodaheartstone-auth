@@ -200,7 +200,7 @@ async def cb_article(q: CallbackQuery) -> None:
             "/wp-json/vip/v1/issue",
             {
                 "post_id": item["post_id"],
-                "locker_id": item["locker_id"],
+                "code": item["code"],
                 "telegram_user_id": q.from_user.id,
             },
         )
