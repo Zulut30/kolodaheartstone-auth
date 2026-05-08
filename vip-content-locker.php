@@ -1321,4 +1321,252 @@ function vip_seo_metabox_save($post_id, $post) {
         }
     }
 }
+
+// ============================================================
+// Telegram bot integration: tokenized one-time access links
+// ============================================================
+
+if (!defined('VIP_BOT_DB_VERSION')) define('VIP_BOT_DB_VERSION', '1');
+
+add_action('init', 'vip_bot_maybe_install');
+function vip_bot_maybe_install() {
+    if (get_option('vip_bot_db_version') === VIP_BOT_DB_VERSION) return;
+    global $wpdb;
+    $c = $wpdb->get_charset_collate();
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta("CREATE TABLE {$wpdb->prefix}vip_access_tokens (
+        token char(64) NOT NULL,
+        locker_id varchar(255) NOT NULL,
+        post_id bigint(20) NOT NULL,
+        telegram_user_id bigint(20) NOT NULL,
+        issued_at datetime NOT NULL,
+        expires_at datetime NOT NULL,
+        used_at datetime DEFAULT NULL,
+        used_ip varchar(100) DEFAULT NULL,
+        PRIMARY KEY (token),
+        KEY tg_user (telegram_user_id),
+        KEY expires (expires_at)
+    ) $c;");
+    update_option('vip_bot_db_version', VIP_BOT_DB_VERSION);
+    if (!get_option('vip_bot_token_ttl')) update_option('vip_bot_token_ttl', 900);
+}
+
+add_action('admin_init', function() {
+    register_setting('vip_bot_opts', 'vip_bot_secret');
+    register_setting('vip_bot_opts', 'vip_bot_token_ttl');
+});
+
+add_action('admin_menu', function() {
+    add_submenu_page('vip-main', 'Telegram бот', 'Telegram бот', 'manage_options', 'vip-bot', 'vip_bot_settings_page');
+}, 20);
+
+function vip_bot_settings_page() {
+    if (isset($_POST['vip_bot_regen']) && check_admin_referer('vip_bot_regen')) {
+        update_option('vip_bot_secret', bin2hex(random_bytes(32)));
+        echo '<div class="notice notice-success"><p>Новый секрет сгенерирован.</p></div>';
+    }
+    $secret = get_option('vip_bot_secret', '');
+    $ttl = intval(get_option('vip_bot_token_ttl', 900));
+    global $wpdb;
+    $tbl = $wpdb->prefix . 'vip_access_tokens';
+    $issued = intval($wpdb->get_var("SELECT COUNT(*) FROM $tbl"));
+    $used = intval($wpdb->get_var("SELECT COUNT(*) FROM $tbl WHERE used_at IS NOT NULL"));
+    ?>
+    <div class="wrap">
+        <h1>Telegram бот</h1>
+        <p>Бот выдаёт одноразовые ссылки разблокировки для подписчиков канала/группы. Ссылка ставит cookie и редиректит на статью.</p>
+
+        <h2>Bearer-секрет</h2>
+        <form method="post" action="options.php">
+            <?php settings_fields('vip_bot_opts'); ?>
+            <table class="form-table">
+                <tr><th>Секрет</th><td>
+                    <input type="text" name="vip_bot_secret" value="<?php echo esc_attr($secret); ?>" class="large-text code" readonly onclick="this.select()">
+                    <p class="description">Передавайте боту в заголовке <code>Authorization: Bearer ...</code>. Без секрета бот не сможет работать.</p>
+                </td></tr>
+                <tr><th>TTL ссылки (сек)</th><td>
+                    <input type="number" name="vip_bot_token_ttl" value="<?php echo esc_attr($ttl); ?>" min="60" max="3600" class="small-text">
+                    <p class="description">Срок жизни одноразовой ссылки. По умолчанию 900 (15 мин).</p>
+                </td></tr>
+            </table>
+            <?php submit_button('Сохранить'); ?>
+        </form>
+
+        <form method="post" style="margin-top:10px">
+            <?php wp_nonce_field('vip_bot_regen'); ?>
+            <button type="submit" name="vip_bot_regen" value="1" class="button" onclick="return confirm('Перегенерировать секрет? Старый перестанет работать.')">Перегенерировать секрет</button>
+        </form>
+
+        <h2 style="margin-top:30px">Эндпоинты</h2>
+        <table class="form-table">
+            <tr><th>List</th><td><code>GET <?php echo esc_html(home_url('/wp-json/vip/v1/lockers')); ?></code></td></tr>
+            <tr><th>Issue</th><td><code>POST <?php echo esc_html(home_url('/wp-json/vip/v1/issue')); ?></code> { post_id, locker_id, telegram_user_id }</td></tr>
+            <tr><th>Redeem</th><td><code>GET <?php echo esc_html(home_url('/wp-json/vip/v1/redeem')); ?>?token=...</code> (публичный)</td></tr>
+        </table>
+
+        <h2>Статистика</h2>
+        <p>Всего выдано: <b><?php echo $issued; ?></b> · Использовано: <b><?php echo $used; ?></b></p>
+
+        <h3>Последние 20 токенов</h3>
+        <table class="wp-list-table widefat striped">
+            <thead><tr><th>Время</th><th>TG user</th><th>Locker</th><th>Post</th><th>Истекает</th><th>Использован</th></tr></thead>
+            <tbody>
+            <?php
+            $rows = $wpdb->get_results("SELECT * FROM $tbl ORDER BY issued_at DESC LIMIT 20");
+            if (!$rows) echo '<tr><td colspan="6" style="text-align:center">Нет данных</td></tr>';
+            foreach ($rows as $r) {
+                $used_txt = $r->used_at ? esc_html($r->used_at) . '<br><small>' . esc_html($r->used_ip) . '</small>' : '—';
+                echo '<tr>'
+                    . '<td>' . esc_html($r->issued_at) . '</td>'
+                    . '<td>' . intval($r->telegram_user_id) . '</td>'
+                    . '<td>' . esc_html($r->locker_id) . '</td>'
+                    . '<td><a href="' . esc_url(get_permalink($r->post_id)) . '">' . intval($r->post_id) . '</a></td>'
+                    . '<td>' . esc_html($r->expires_at) . '</td>'
+                    . '<td>' . $used_txt . '</td>'
+                    . '</tr>';
+            }
+            ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+}
+
+add_action('rest_api_init', 'vip_bot_register_rest');
+function vip_bot_register_rest() {
+    register_rest_route('vip/v1', '/redeem', [
+        'methods'  => 'GET',
+        'callback' => 'vip_bot_redeem',
+        'permission_callback' => '__return_true',
+    ]);
+    register_rest_route('vip/v1', '/issue', [
+        'methods'  => 'POST',
+        'callback' => 'vip_bot_issue',
+        'permission_callback' => 'vip_bot_check_bearer',
+    ]);
+    register_rest_route('vip/v1', '/lockers', [
+        'methods'  => 'GET',
+        'callback' => 'vip_bot_lockers',
+        'permission_callback' => 'vip_bot_check_bearer',
+    ]);
+}
+
+function vip_bot_check_bearer($request) {
+    $expected = trim((string) get_option('vip_bot_secret', ''));
+    if ($expected === '') {
+        return new WP_Error('vip_no_secret', 'Bot secret not configured', ['status' => 503]);
+    }
+    $auth = $request->get_header('authorization');
+    if (!$auth) $auth = $request->get_header('x_vip_bearer');
+    if (!$auth) {
+        return new WP_Error('vip_auth', 'Missing Authorization header', ['status' => 401]);
+    }
+    $given = (stripos($auth, 'Bearer ') === 0) ? trim(substr($auth, 7)) : trim($auth);
+    if (!hash_equals($expected, $given)) {
+        return new WP_Error('vip_auth', 'Invalid bearer', ['status' => 401]);
+    }
+    return true;
+}
+
+function vip_bot_lockers($request) {
+    global $wpdb;
+    $rows = $wpdb->get_results("
+        SELECT ID, post_title, post_content, post_date
+        FROM {$wpdb->posts}
+        WHERE post_status='publish'
+          AND post_type IN ('post','page')
+          AND post_content LIKE '%[panelVIP%'
+        ORDER BY post_date DESC
+        LIMIT 200
+    ");
+    $out = [];
+    $seen = [];
+    foreach ($rows as $r) {
+        if (!preg_match_all('/\[panelVIP\b([^\]]*)\]/i', $r->post_content, $m)) continue;
+        foreach ($m[1] as $attrs) {
+            if (!preg_match('/\bid\s*=\s*(["\'])([^"\']+)\1/i', $attrs, $idm)) continue;
+            $locker_id = $idm[2];
+            $key = $r->ID . '|' . $locker_id;
+            if (isset($seen[$key])) continue;
+            $seen[$key] = true;
+            $out[] = [
+                'post_id'   => (int) $r->ID,
+                'locker_id' => $locker_id,
+                'title'     => html_entity_decode(get_the_title($r->ID), ENT_QUOTES, 'UTF-8'),
+                'url'       => get_permalink($r->ID),
+                'date'      => $r->post_date,
+            ];
+        }
+    }
+    return rest_ensure_response($out);
+}
+
+function vip_bot_issue($request) {
+    $params = $request->get_json_params();
+    if (!is_array($params)) $params = $request->get_params();
+    $locker_id = isset($params['locker_id']) ? sanitize_text_field($params['locker_id']) : '';
+    $post_id   = isset($params['post_id'])   ? intval($params['post_id'])              : 0;
+    $tg_user   = isset($params['telegram_user_id']) ? intval($params['telegram_user_id']) : 0;
+    if ($locker_id === '' || $post_id <= 0 || $tg_user === 0) {
+        return new WP_Error('vip_bad_input', 'Missing locker_id, post_id or telegram_user_id', ['status' => 400]);
+    }
+    if (!get_post($post_id)) {
+        return new WP_Error('vip_no_post', 'Post not found', ['status' => 404]);
+    }
+    $ttl = max(60, min(3600, intval(get_option('vip_bot_token_ttl', 900))));
+    $token = bin2hex(random_bytes(32));
+    global $wpdb;
+    $ok = $wpdb->insert($wpdb->prefix . 'vip_access_tokens', [
+        'token'             => $token,
+        'locker_id'         => $locker_id,
+        'post_id'           => $post_id,
+        'telegram_user_id'  => $tg_user,
+        'issued_at'         => current_time('mysql'),
+        'expires_at'        => date('Y-m-d H:i:s', time() + $ttl),
+    ]);
+    if ($ok === false) {
+        return new WP_Error('vip_db', 'DB insert failed', ['status' => 500]);
+    }
+    $url = add_query_arg('token', $token, rest_url('vip/v1/redeem'));
+    return rest_ensure_response([
+        'token'      => $token,
+        'url'        => $url,
+        'expires_at' => gmdate('c', time() + $ttl),
+        'ttl'        => $ttl,
+    ]);
+}
+
+function vip_bot_redeem($request) {
+    $token = sanitize_text_field($request->get_param('token'));
+    if ($token === '' || !preg_match('/^[a-f0-9]{64}$/', $token)) {
+        wp_die('Неверный токен', 'VIP', ['response' => 400]);
+    }
+    global $wpdb;
+    $tbl = $wpdb->prefix . 'vip_access_tokens';
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $tbl WHERE token = %s", $token));
+    if (!$row)                                wp_die('Ссылка не найдена',           'VIP', ['response' => 404]);
+    if ($row->used_at)                        wp_die('Ссылка уже использована',     'VIP', ['response' => 410]);
+    if (strtotime($row->expires_at) < time()) wp_die('Срок действия ссылки истёк',  'VIP', ['response' => 410]);
+
+    $wpdb->update($tbl, [
+        'used_at' => current_time('mysql'),
+        'used_ip' => substr((string) ($_SERVER['REMOTE_ADDR'] ?? ''), 0, 100),
+    ], ['token' => $token]);
+
+    $hours = max(1, intval(get_option('vip_access_hours', 12)));
+    $cookie_name = 'vip_' . md5($row->locker_id);
+    setcookie($cookie_name, 'ok', [
+        'expires'  => time() + $hours * 3600,
+        'path'     => '/',
+        'secure'   => is_ssl(),
+        'httponly' => false,
+        'samesite' => 'Lax',
+    ]);
+    $_COOKIE[$cookie_name] = 'ok';
+
+    $target = get_permalink($row->post_id);
+    if (!$target) $target = home_url('/');
+    wp_safe_redirect($target);
+    exit;
+}
 ?>
