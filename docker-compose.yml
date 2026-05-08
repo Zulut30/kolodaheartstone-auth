@@ -4,8 +4,13 @@ services:
     container_name: kha-vip-bot
     restart: unless-stopped
     env_file: ./bot/.env
+    volumes:
+      - bot_cache:/data
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  bot_cache:

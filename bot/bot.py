@@ -1,23 +1,27 @@
 """
 Telegram bot for kolodahearthstone.ru VIP content unlock.
 
-UI:
-  /start            welcome card with cover, "Latest article" / catalog CTAs
-  /catalog          card-style article browser (1 article per screen)
-  Navigation        ◀ / ▶ between articles
-  "Latest article"  one tap to issue link for the freshest post
+Why we upload image bytes ourselves instead of passing URLs to Telegram:
+the WP host blocks/throttles Telegram's downloader (sendPhoto with the raw
+URL succeeds for ~13% of images and takes ~2s on average). So the bot
+fetches each cover with a normal browser User-Agent and uploads the bytes
+once. Telegram returns a file_id, we cache it on disk, and from then on
+every render is essentially instant.
 
-Performance:
-  Lockers list is shared across users with a 5-min cache + a startup
-  prefetch. Photos are sent by URL the first time, then re-used by file_id
-  on subsequent renders — that's what makes ◀▶ feel instant after warmup.
+Caches (all keyed by image URL):
+  PHOTO_CACHE   url -> file_id   (persisted to /data/photo_cache.json)
+  IMAGE_BYTES   url -> bytes     (in memory, populated by prefetch / on demand)
+
+Lockers list is fetched from WP once per ~5 min and shared across users.
 """
 import asyncio
 import html
+import json
 import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -28,6 +32,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -50,10 +55,15 @@ CHANNEL_ID = int(env("CHANNEL_ID"))
 GROUP_ID = int(env("GROUP_ID"))
 SUBSCRIBE_LINKS = env("SUBSCRIBE_LINKS", "", required=False)
 HTTP_TIMEOUT = float(env("HTTP_TIMEOUT", "10", required=False))
+DATA_DIR = Path(env("DATA_DIR", "/data", required=False))
 
 CAPTION_LIMIT = 1024
 SUB_CACHE_TTL = 60.0
 LOCKERS_CACHE_TTL = 300.0
+IMAGE_FETCH_UA = "Mozilla/5.0 (compatible; KolodaHearthstoneBot/1.0)"
+IMAGE_FETCH_TIMEOUT = 20.0
+PREFETCH_CONCURRENCY = 8
+PHOTO_CACHE_FILE = DATA_DIR / "photo_cache.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,14 +77,51 @@ dp = Dispatcher()
 # ----- Caches -----
 SHARED_LOCKERS: list[dict[str, Any]] = []
 SHARED_LOCKERS_TS: float = 0.0
-SHARED_LOCKERS_LOCK: asyncio.Lock | None = None  # created in main()
+SHARED_LOCKERS_LOCK: asyncio.Lock | None = None
 
 SUB_CACHE: dict[int, tuple[bool, float]] = {}
 
-# image URL -> Telegram file_id (file_id is per-bot, valid forever)
-PHOTO_CACHE: dict[str, str] = {}
+PHOTO_CACHE: dict[str, str] = {}              # url -> file_id (persisted)
+IMAGE_BYTES: dict[str, bytes] = {}            # url -> bytes (in memory)
+IMAGE_FETCH_LOCKS: dict[str, asyncio.Lock] = {}
 
 ALLOWED_STATUSES = {"member", "administrator", "creator"}
+
+
+# =====================================================
+#  Persistent photo cache
+# =====================================================
+
+def _load_photo_cache() -> None:
+    try:
+        if PHOTO_CACHE_FILE.exists():
+            with PHOTO_CACHE_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                PHOTO_CACHE.update({str(k): str(v) for k, v in data.items()})
+                log.info("photo cache loaded: %d entries", len(PHOTO_CACHE))
+    except Exception:
+        log.exception("photo cache load failed")
+
+
+def _save_photo_cache() -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PHOTO_CACHE_FILE.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(PHOTO_CACHE, f, ensure_ascii=False)
+        tmp.replace(PHOTO_CACHE_FILE)
+    except Exception:
+        log.exception("photo cache save failed")
+
+
+def _store_file_id(url: str, sent: Any) -> None:
+    if not url or not isinstance(sent, Message) or not sent.photo:
+        return
+    file_id = sent.photo[-1].file_id
+    if PHOTO_CACHE.get(url) != file_id:
+        PHOTO_CACHE[url] = file_id
+        _save_photo_cache()
 
 
 # =====================================================
@@ -129,7 +176,6 @@ async def wp_post(path: str, payload: dict) -> Any:
 
 
 async def get_lockers(*, force: bool = False) -> list[dict[str, Any]]:
-    """Single shared cache for all users."""
     global SHARED_LOCKERS, SHARED_LOCKERS_TS
     assert SHARED_LOCKERS_LOCK is not None
     now = time.monotonic()
@@ -140,7 +186,7 @@ async def get_lockers(*, force: bool = False) -> list[dict[str, Any]]:
             data = await wp_get("/wp-json/vip/v1/lockers")
         except Exception:
             log.exception("get_lockers: WP request failed")
-            return SHARED_LOCKERS  # serve stale rather than empty
+            return SHARED_LOCKERS
         if isinstance(data, list):
             SHARED_LOCKERS = data
             SHARED_LOCKERS_TS = now
@@ -148,17 +194,68 @@ async def get_lockers(*, force: bool = False) -> list[dict[str, Any]]:
 
 
 # =====================================================
-#  Photo cache helpers (file_id reuse for instant re-renders)
+#  Image fetching
 # =====================================================
 
-def _media_for(url: str) -> str:
-    return PHOTO_CACHE.get(url, url)
+async def _fetch_image_bytes(url: str) -> bytes | None:
+    if not url:
+        return None
+    lock = IMAGE_FETCH_LOCKS.setdefault(url, asyncio.Lock())
+    async with lock:
+        if url in IMAGE_BYTES:
+            return IMAGE_BYTES[url]
+        try:
+            async with httpx.AsyncClient(
+                timeout=IMAGE_FETCH_TIMEOUT,
+                follow_redirects=True,
+                headers={"User-Agent": IMAGE_FETCH_UA},
+            ) as client:
+                r = await client.get(url)
+            if r.status_code != 200:
+                log.warning("image fetch %s: %d", url, r.status_code)
+                return None
+            ctype = r.headers.get("content-type", "")
+            if "image" not in ctype.lower():
+                log.warning("image fetch %s: non-image content-type=%s", url, ctype)
+                return None
+            IMAGE_BYTES[url] = r.content
+            return r.content
+        except Exception as e:
+            log.warning("image fetch %s: err=%s", url, e)
+            return None
 
 
-def _store_file_id(url: str, sent: Any) -> None:
-    if not url or not isinstance(sent, Message) or not sent.photo:
-        return
-    PHOTO_CACHE[url] = sent.photo[-1].file_id
+def _filename_from_url(url: str) -> str:
+    name = url.rsplit("/", 1)[-1].split("?", 1)[0] or "cover"
+    if "." not in name:
+        name += ".jpg"
+    return name
+
+
+async def _photo_payload(url: str) -> tuple[Any, str] | tuple[None, None]:
+    """
+    Returns (payload, kind) where kind is one of 'file_id' / 'bytes'.
+    Tries cached file_id first, then locally cached bytes, then on-demand fetch.
+    """
+    file_id = PHOTO_CACHE.get(url)
+    if file_id:
+        return file_id, "file_id"
+
+    img_bytes = IMAGE_BYTES.get(url)
+    if img_bytes is None:
+        img_bytes = await _fetch_image_bytes(url)
+    if img_bytes:
+        return BufferedInputFile(img_bytes, filename=_filename_from_url(url)), "bytes"
+
+    return None, None
+
+
+# =====================================================
+#  Photo send/edit primitives
+# =====================================================
+
+def _is_not_modified(err: TelegramBadRequest) -> bool:
+    return "not modified" in (err.message or "").lower()
 
 
 async def send_photo_cached(
@@ -169,22 +266,28 @@ async def send_photo_cached(
 ) -> bool:
     if not image_url:
         return False
-    media = _media_for(image_url)
+
+    payload, kind = await _photo_payload(image_url)
+    if payload is None:
+        return False
     try:
-        sent = await msg.answer_photo(media, caption=caption, reply_markup=kb)
+        sent = await msg.answer_photo(payload, caption=caption, reply_markup=kb)
         _store_file_id(image_url, sent)
         return True
     except TelegramBadRequest as e:
-        if media != image_url:
+        log.warning("answer_photo (%s) url=%s err=%s", kind, image_url, e.message)
+        if kind == "file_id":
             PHOTO_CACHE.pop(image_url, None)
+            _save_photo_cache()
+            payload2, kind2 = await _photo_payload(image_url)
+            if payload2 is None or kind2 == "file_id":
+                return False
             try:
-                sent = await msg.answer_photo(image_url, caption=caption, reply_markup=kb)
+                sent = await msg.answer_photo(payload2, caption=caption, reply_markup=kb)
                 _store_file_id(image_url, sent)
                 return True
             except TelegramBadRequest as e2:
                 log.warning("answer_photo retry url=%s err=%s", image_url, e2.message)
-        else:
-            log.warning("answer_photo url=%s err=%s", image_url, e.message)
     return False
 
 
@@ -196,10 +299,13 @@ async def edit_to_photo_cached(
 ) -> bool:
     if not image_url:
         return False
-    media = _media_for(image_url)
+
+    payload, kind = await _photo_payload(image_url)
+    if payload is None:
+        return False
     try:
         result = await msg.edit_media(
-            media=InputMediaPhoto(media=media, caption=caption, parse_mode=ParseMode.HTML),
+            media=InputMediaPhoto(media=payload, caption=caption, parse_mode=ParseMode.HTML),
             reply_markup=kb,
         )
         if isinstance(result, Message):
@@ -208,11 +314,16 @@ async def edit_to_photo_cached(
     except TelegramBadRequest as e:
         if _is_not_modified(e):
             return True
-        if media != image_url:
+        log.info("edit_media (%s) url=%s err=%s", kind, image_url, e.message)
+        if kind == "file_id":
             PHOTO_CACHE.pop(image_url, None)
+            _save_photo_cache()
+            payload2, kind2 = await _photo_payload(image_url)
+            if payload2 is None or kind2 == "file_id":
+                return False
             try:
                 result = await msg.edit_media(
-                    media=InputMediaPhoto(media=image_url, caption=caption, parse_mode=ParseMode.HTML),
+                    media=InputMediaPhoto(media=payload2, caption=caption, parse_mode=ParseMode.HTML),
                     reply_markup=kb,
                 )
                 if isinstance(result, Message):
@@ -220,8 +331,6 @@ async def edit_to_photo_cached(
                 return True
             except TelegramBadRequest as e2:
                 log.info("edit_media retry url=%s err=%s", image_url, e2.message)
-        else:
-            log.info("edit_media url=%s err=%s", image_url, e.message)
     return False
 
 
@@ -276,7 +385,7 @@ SUBSCRIBE_BUTTONS = parse_subscribe_links()
 
 
 # =====================================================
-#  Welcome / subscribe screens
+#  Welcome / subscribe
 # =====================================================
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
@@ -296,7 +405,7 @@ async def send_welcome_screen(msg: Message) -> None:
                 cover_url = l["image"]
                 break
     except Exception:
-        log.exception("welcome: get_lockers failed; falling back to text")
+        log.exception("welcome: get_lockers failed")
 
     kb = welcome_keyboard()
     if cover_url and await send_photo_cached(msg, cover_url, WELCOME_TEXT, kb):
@@ -363,10 +472,6 @@ def card_keyboard(idx: int, total: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _is_not_modified(err: TelegramBadRequest) -> bool:
-    return "not modified" in (err.message or "").lower()
-
-
 async def render_card(
     msg: Message,
     *,
@@ -386,13 +491,7 @@ async def render_card(
         return
 
     is_photo_msg = bool(getattr(msg, "photo", None))
-    log.info(
-        "render_card idx=%s total=%s image=%s prev=%s",
-        idx, total, "yes" if image else "no",
-        "photo" if is_photo_msg else "text",
-    )
 
-    # Cross-type: text->photo means we must drop and resend
     if image and not is_photo_msg:
         try:
             await msg.delete()
@@ -403,7 +502,6 @@ async def render_card(
         await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
         return
 
-    # Cross-type: photo->text — drop the photo card
     if not image and is_photo_msg:
         try:
             await msg.delete()
@@ -412,7 +510,6 @@ async def render_card(
         await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
         return
 
-    # Same type — edit in place
     if image:
         if await edit_to_photo_cached(msg, image, caption, kb):
             return
@@ -425,7 +522,6 @@ async def render_card(
                 return
             log.info("edit_text failed: %s", e.message)
 
-    # Last resort: drop and resend
     try:
         await msg.delete()
     except TelegramBadRequest:
@@ -550,6 +646,7 @@ async def cb_refresh(q: CallbackQuery) -> None:
         return
     await q.answer("Обновляю каталог…")
     await get_lockers(force=True)
+    asyncio.create_task(_prefetch_image_bytes())  # fire-and-forget refresh
     await open_catalog(q.message, idx=0, edit_message=q.message)
 
 
@@ -606,13 +703,7 @@ async def open_catalog(
     idx = max(0, min(len(lockers) - 1, idx))
     item = lockers[idx]
     target = edit_message or msg
-    await render_card(
-        target,
-        item=item,
-        idx=idx,
-        total=len(lockers),
-        edit=edit_message is not None,
-    )
+    await render_card(target, item=item, idx=idx, total=len(lockers), edit=edit_message is not None)
 
 
 @dp.callback_query(F.data.startswith("art:"))
@@ -636,12 +727,41 @@ async def cb_article(q: CallbackQuery) -> None:
 #  Lifecycle
 # =====================================================
 
+async def _prefetch_image_bytes() -> None:
+    lockers = await get_lockers()
+    urls = [
+        l["image"] for l in lockers
+        if l.get("image") and l["image"] not in PHOTO_CACHE and l["image"] not in IMAGE_BYTES
+    ]
+    if not urls:
+        log.info(
+            "image prefetch: %d cached as file_id, %d in memory — nothing to fetch",
+            len([1 for l in lockers if l.get("image") in PHOTO_CACHE]),
+            len([1 for l in lockers if l.get("image") in IMAGE_BYTES]),
+        )
+        return
+
+    log.info("image prefetch: %d to fetch", len(urls))
+    sem = asyncio.Semaphore(PREFETCH_CONCURRENCY)
+
+    async def fetch(u: str) -> None:
+        async with sem:
+            await _fetch_image_bytes(u)
+
+    await asyncio.gather(*[fetch(u) for u in urls], return_exceptions=True)
+    ok = sum(1 for u in urls if u in IMAGE_BYTES)
+    log.info("image prefetch done: %d/%d bytes ready", ok, len(urls))
+
+
 async def main() -> None:
     global SHARED_LOCKERS_LOCK
     SHARED_LOCKERS_LOCK = asyncio.Lock()
 
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _load_photo_cache()
+
     me = await bot.get_me()
-    log.info("starting bot @%s id=%s", me.username, me.id)
+    log.info("starting bot @%s id=%s data=%s", me.username, me.id, DATA_DIR)
     log.info("WP base: %s", WP_BASE_URL)
 
     await bot.set_my_commands([
@@ -650,19 +770,19 @@ async def main() -> None:
         BotCommand(command="help", description="Помощь"),
     ])
 
-    # Pre-fetch the catalog so the first /start hits a warm cache.
-    asyncio.create_task(_prefetch_lockers())
+    asyncio.create_task(_warmup())
 
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
-async def _prefetch_lockers() -> None:
+async def _warmup() -> None:
     try:
         await get_lockers(force=True)
-        log.info("prefetch: %d lockers cached", len(SHARED_LOCKERS))
+        log.info("lockers warmup: %d cached", len(SHARED_LOCKERS))
+        await _prefetch_image_bytes()
     except Exception:
-        log.exception("prefetch failed")
+        log.exception("warmup failed")
 
 
 if __name__ == "__main__":
