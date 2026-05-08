@@ -283,6 +283,17 @@ def _is_not_modified(err: TelegramBadRequest) -> bool:
     return "not modified" in (err.message or "").lower()
 
 
+async def _send_fresh_card(msg: Message, *, image: str, caption: str, kb: InlineKeyboardMarkup) -> None:
+    """Always create a brand new card (used when edit isn't possible)."""
+    if image:
+        try:
+            await msg.answer_photo(image, caption=caption, reply_markup=kb)
+            return
+        except TelegramBadRequest as e:
+            log.warning("answer_photo failed image=%s err=%s — falling back to text", image, e.message)
+    await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
+
+
 async def render_card(
     msg: Message,
     *,
@@ -295,33 +306,52 @@ async def render_card(
     kb = card_keyboard(idx, total)
     image = (item.get("image") or "").strip()
 
-    if edit:
-        try:
-            if image:
-                await msg.edit_media(
-                    media=InputMediaPhoto(media=image, caption=caption, parse_mode=ParseMode.HTML),
-                    reply_markup=kb,
-                )
-            else:
-                await msg.edit_text(caption, reply_markup=kb, disable_web_page_preview=True)
-            return
-        except TelegramBadRequest as e:
-            if _is_not_modified(e):
-                return
-            log.info("edit fallback (%s); sending fresh card", e.message)
-            try:
-                await msg.delete()
-            except TelegramBadRequest:
-                pass
+    if not edit:
+        await _send_fresh_card(msg, image=image, caption=caption, kb=kb)
+        return
 
-    if image:
-        try:
-            await msg.answer_photo(image, caption=caption, reply_markup=kb)
-            return
-        except TelegramBadRequest as e:
-            log.warning("answer_photo failed for %s: %s — falling back to text", image, e.message)
+    is_photo_msg = bool(getattr(msg, "photo", None))
+    log.info(
+        "render_card idx=%s total=%s image=%s edit=%s prev=%s",
+        idx, total, "yes" if image else "no", edit,
+        "photo" if is_photo_msg else "text",
+    )
 
-    await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
+    # text -> photo  or  photo -> text  : can't edit across types, drop and resend
+    if image and not is_photo_msg:
+        try:
+            await msg.delete()
+        except TelegramBadRequest:
+            pass
+        await _send_fresh_card(msg, image=image, caption=caption, kb=kb)
+        return
+
+    if not image and is_photo_msg:
+        try:
+            await msg.delete()
+        except TelegramBadRequest:
+            pass
+        await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
+        return
+
+    # same-type edit
+    try:
+        if image:
+            await msg.edit_media(
+                media=InputMediaPhoto(media=image, caption=caption, parse_mode=ParseMode.HTML),
+                reply_markup=kb,
+            )
+        else:
+            await msg.edit_text(caption, reply_markup=kb, disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        if _is_not_modified(e):
+            return
+        log.info("edit failed (%s); sending fresh card", e.message)
+        try:
+            await msg.delete()
+        except TelegramBadRequest:
+            pass
+        await _send_fresh_card(msg, image=image, caption=caption, kb=kb)
 
 
 # =====================================================
