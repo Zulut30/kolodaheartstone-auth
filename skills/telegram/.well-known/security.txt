@@ -1,0 +1,6 @@
+Contact: https://github.com/Zulut30/telegram-skills/security/advisories/new
+Expires: 2027-01-01T00:00:00.000Z
+Preferred-Languages: en, ru, pl
+Canonical: https://raw.githubusercontent.com/Zulut30/telegram-skills/main/.well-known/security.txt
+Policy: https://github.com/Zulut30/telegram-skills/blob/main/SECURITY.md
+Acknowledgments: https://github.com/Zulut30/telegram-skills/blob/main/docs/SECURITY_THANKS.md

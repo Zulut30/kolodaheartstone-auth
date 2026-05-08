@@ -1,0 +1,107 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v15
+        with:
+          globs: "**/*.md"
+          config: .markdownlint.yaml
+        continue-on-error: true
+
+  frontmatter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: Validate command frontmatter
+        run: python tests/validate_frontmatter.py
+
+  plugin-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate plugin.json
+        run: python tests/validate_plugin_manifest.py
+
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --accept 200,429 --exclude-path examples/ '**/*.md'
+        continue-on-error: true
+
+  sync-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify four-format sync
+        run: python tests/check_sync.py
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify VERSION / plugin.json / CHANGELOG / SKILL.md version sync
+        run: python tests/check_version_sync.py
+
+  install-sh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck install.sh
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck install.sh
+      - name: Dry-run install.sh --check
+        run: bash install.sh --check
+
+  example-bot-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.12"
+            experimental: false
+          - python-version: "3.13"
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install example bot deps
+        working-directory: examples/01-vip-media-bot
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Lint
+        working-directory: examples/01-vip-media-bot
+        run: ruff check app
+      - name: Test
+        working-directory: examples/01-vip-media-bot
+        run: pytest tests/ -v

@@ -1,0 +1,30 @@
+{
+  "name": "wordpress-plugin-dev-skill",
+  "version": "0.1.0",
+  "description": "Portable Agent Skill for modern WordPress plugin development.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "validate": "node skills/wordpress-plugin-dev/scripts/validate-skill.mjs",
+    "validate:skill": "node skills/wordpress-plugin-dev/scripts/validate-skill.mjs",
+    "check:sources": "node skills/wordpress-plugin-dev/scripts/check-source-map.mjs",
+    "check:links": "node skills/wordpress-plugin-dev/scripts/check-markdown-links.mjs",
+    "audit:fixture": "node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs skills/wordpress-plugin-dev/fixtures/demo-plugin",
+    "performance:audit": "node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs test-fixtures/performance-plugin --performance",
+    "performance:audit:json": "node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs test-fixtures/performance-plugin --performance --json",
+    "design:audit": "node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs test-fixtures/design-plugin --design",
+    "design:audit:json": "node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs test-fixtures/design-plugin --design --json",
+    "compatibility:audit": "node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs test-fixtures/compatibility-plugin --compatibility",
+    "compatibility:audit:json": "node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs test-fixtures/compatibility-plugin --compatibility --json",
+    "lint:php": "node scripts/lint-php-files.mjs",
+    "test:audit": "node skills/wordpress-plugin-dev/scripts/audit-plugin.test.mjs",
+    "package:skill": "node scripts/package-release.mjs",
+    "release:check": "npm run validate:skill && npm run smoke && npm run lint:php && npm run package:skill",
+    "sync:targets": "node skills/wordpress-plugin-dev/scripts/sync-install-targets.mjs",
+    "sync": "node skills/wordpress-plugin-dev/scripts/sync-install-targets.mjs",
+    "smoke": "npm run validate:skill && npm run check:sources && npm run check:links && npm run test:audit && npm run audit:fixture && npm run performance:audit && npm run performance:audit:json && npm run design:audit && npm run design:audit:json && npm run compatibility:audit && npm run compatibility:audit:json"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

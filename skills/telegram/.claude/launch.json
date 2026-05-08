@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "landing-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8000", "--directory", "docs/landing"],
+      "port": 8000
+    },
+    {
+      "name": "example-bot",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "app"],
+      "port": 8080
+    },
+    {
+      "name": "example-bot-compose",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "-f", "examples/01-vip-media-bot/docker-compose.yml", "up"],
+      "port": 8080
+    }
+  ]
+}

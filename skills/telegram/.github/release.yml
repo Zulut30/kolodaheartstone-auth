@@ -1,0 +1,22 @@
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+      - dependencies
+  categories:
+    - title: 🎯 New features
+      labels: [feature, enhancement]
+    - title: 🧩 New slash commands
+      labels: [command]
+    - title: 📚 New references
+      labels: [reference, docs]
+    - title: 🐛 Fixes
+      labels: [bug, fix]
+    - title: 🏗 Refactoring
+      labels: [refactor]
+    - title: 🔒 Security
+      labels: [security]
+    - title: 🧪 Tests & CI
+      labels: [test, ci]
+    - title: Other
+      labels: ["*"]

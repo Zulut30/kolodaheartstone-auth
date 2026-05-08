@@ -1,0 +1,30 @@
+name: New VIP bot must follow 6-stage workflow
+description: |
+  Full workflow output with ADR, tree, files in dependency order, self-review,
+  deploy instructions. Uses aiogram 3, Postgres, Redis, Docker. No monolith.
+
+contains_sections:
+  - "ADR"
+  - "Дерево"
+  - "Self-review"
+
+required_patterns:
+  - 'aiogram'
+  - 'SQLAlchemy|sqlalchemy'
+  - 'alembic|Alembic'
+  - 'pydantic'
+  - 'async def'
+  - 'XTR'
+  - 'Docker|docker-compose|Dockerfile'
+  - 'currency\s*=\s*"XTR"'
+  - 'provider_token\s*=\s*""'
+
+forbidden_patterns:
+  - 'import requests\b'
+  - 'from requests import'
+  - 'provider_token\s*=\s*"[A-Z0-9]{10,}"'
+
+min_code_blocks: 5
+
+mentions_modes:
+  - "Pro"

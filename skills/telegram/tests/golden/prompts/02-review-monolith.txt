@@ -1,0 +1,31 @@
+BotForge: review
+
+Вот мой бот, всё в одном файле main.py. Можешь провести code review?
+
+```python
+import os
+import requests
+from aiogram import Bot, Dispatcher
+import sqlite3
+
+BOT_TOKEN = "1234567890:ABCDEFghijklmnopQRSTUVwxyz"
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+conn = sqlite3.connect("bot.db")
+
+@dp.message()
+async def on_message(message):
+    user_id = message.from_user.id
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute(f"INSERT INTO users VALUES ({user_id}, '{message.from_user.username}')")
+        conn.commit()
+    r = requests.post("https://api.example.com/track", json={"user": user_id})
+    await message.answer("Привет!")
+
+if __name__ == "__main__":
+    dp.run_polling(bot)
+```

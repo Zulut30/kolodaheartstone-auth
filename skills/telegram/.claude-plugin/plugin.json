@@ -1,0 +1,84 @@
+{
+  "name": "botforge",
+  "displayName": "BotForge — Telegram Bot Engineering Skill",
+  "version": "1.7.1",
+  "description": "Production-grade Telegram bot engineering skill. Enforces modular aiogram 3 architecture, Postgres + SQLAlchemy + Alembic, Docker, proper error handling, Mini Apps, unified payments (Stars/ЮKassa/CryptoBot/Stripe/Tribute), i18n, observability. Grounded in official Telegram Bot API 9.6.",
+  "author": {
+    "name": "BotForge contributors",
+    "url": "https://github.com/Zulut30/telegram-skills"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/Zulut30/telegram-skills",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zulut30/telegram-skills.git"
+  },
+  "keywords": [
+    "telegram",
+    "aiogram",
+    "bot",
+    "python",
+    "mini-app",
+    "payments",
+    "claude-code",
+    "agent-skill",
+    "webapp",
+    "fastapi"
+  ],
+  "skills": [
+    {
+      "name": "botforge",
+      "path": ".claude/skills/botforge/SKILL.md",
+      "description": "Senior Telegram bot engineer and product architect. Builds production-grade bots with 6-stage workflow (Brief → ADR → Tree → Files → Self-review → Deploy)."
+    }
+  ],
+  "commands": [
+    { "name": "botforge-new", "path": ".claude/commands/botforge-new.md" },
+    { "name": "botforge-extend", "path": ".claude/commands/botforge-extend.md" },
+    { "name": "botforge-review", "path": ".claude/commands/botforge-review.md" },
+    { "name": "botforge-refactor", "path": ".claude/commands/botforge-refactor.md" },
+    { "name": "botforge-miniapp", "path": ".claude/commands/botforge-miniapp.md" },
+    { "name": "botforge-auth", "path": ".claude/commands/botforge-auth.md" },
+    { "name": "botforge-payments", "path": ".claude/commands/botforge-payments.md" },
+    { "name": "botforge-broadcast", "path": ".claude/commands/botforge-broadcast.md" },
+    { "name": "botforge-admin", "path": ".claude/commands/botforge-admin.md" },
+    { "name": "botforge-test", "path": ".claude/commands/botforge-test.md" },
+    { "name": "botforge-deploy", "path": ".claude/commands/botforge-deploy.md" },
+    { "name": "botforge-security", "path": ".claude/commands/botforge-security.md" },
+    { "name": "botforge-botfather", "path": ".claude/commands/botforge-botfather.md" },
+    { "name": "botforge-i18n", "path": ".claude/commands/botforge-i18n.md" },
+    { "name": "botforge-observability", "path": ".claude/commands/botforge-observability.md" },
+    { "name": "botforge-scheduler", "path": ".claude/commands/botforge-scheduler.md" },
+    { "name": "botforge-inline", "path": ".claude/commands/botforge-inline.md" },
+    { "name": "botforge-admin-web", "path": ".claude/commands/botforge-admin-web.md" },
+    { "name": "botforge-help", "path": ".claude/commands/botforge-help.md" }
+  ],
+  "references": [
+    ".claude/skills/botforge/references/architecture.md",
+    ".claude/skills/botforge/references/patterns.md",
+    ".claude/skills/botforge/references/examples.md",
+    ".claude/skills/botforge/references/checklists.md",
+    ".claude/skills/botforge/references/miniapp.md",
+    ".claude/skills/botforge/references/auth.md",
+    ".claude/skills/botforge/references/payments.md",
+    ".claude/skills/botforge/references/telegram-api-spec.md",
+    ".claude/skills/botforge/references/botfather-setup.md",
+    ".claude/skills/botforge/references/i18n.md",
+    ".claude/skills/botforge/references/observability.md",
+    ".claude/skills/botforge/references/scheduler.md",
+    ".claude/skills/botforge/references/subscriptions.md",
+    ".claude/skills/botforge/references/inline-mode.md",
+    ".claude/skills/botforge/references/groups-and-channels.md",
+    ".claude/skills/botforge/references/media.md",
+    ".claude/skills/botforge/references/faq.md",
+    ".claude/skills/botforge/references/performance.md",
+    ".claude/skills/botforge/references/anti-spam.md",
+    ".claude/skills/botforge/references/gdpr-compliance.md",
+    ".claude/skills/botforge/references/analytics.md",
+    ".claude/skills/botforge/references/anti-patterns.md",
+    ".claude/skills/botforge/references/admin-panel.md"
+  ],
+  "engines": {
+    "claude-code": ">=1.0.0"
+  }
+}

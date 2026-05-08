@@ -1,0 +1,18 @@
+# Default owners
+*                                           @Zulut30
+
+# Skill content — requires maintainer review
+/.claude/skills/                            @Zulut30
+/.claude/commands/                          @Zulut30
+/system_prompt.txt                          @Zulut30
+/.claude-plugin/plugin.json                 @Zulut30
+
+# Security-sensitive references
+/.claude/skills/botforge/references/auth.md            @Zulut30
+/.claude/skills/botforge/references/payments.md        @Zulut30
+/.claude/skills/botforge/references/miniapp.md         @Zulut30
+/.claude/skills/botforge/references/telegram-api-spec.md  @Zulut30
+
+# CI / tooling
+/.github/                                   @Zulut30
+/tests/                                     @Zulut30

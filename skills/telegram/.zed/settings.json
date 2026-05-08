@@ -1,0 +1,20 @@
+{
+  "assistant": {
+    "default_model": {
+      "provider": "anthropic",
+      "model": "claude-opus-4-5"
+    },
+    "version": "2"
+  },
+  "file_types": {
+    "Markdown": ["mdc"]
+  },
+  "soft_wrap": "editor_width",
+  "rulers": [100],
+  "languages": {
+    "Python": {
+      "preferred_line_length": 100,
+      "format_on_save": "on"
+    }
+  }
+}

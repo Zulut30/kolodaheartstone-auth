@@ -1,0 +1,37 @@
+User-agent: *
+Allow: /
+
+# Major search engines — explicit allow
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: YandexBot
+Allow: /
+
+User-agent: DuckDuckBot
+Allow: /
+
+User-agent: Applebot
+Allow: /
+
+# AI / LLM crawlers — allow (this site is an open-source skill for AI)
+User-agent: GPTBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+Sitemap: https://zulut30.github.io/telegram-skills/sitemap.xml
+Host: https://zulut30.github.io/telegram-skills/

@@ -1,0 +1,20 @@
+name: Mini App integration must use official HMAC and secure JWT
+description: |
+  HMAC-SHA256 with WebAppData secret, auth_date freshness check, JWT with TTL,
+  CORS whitelist, no reliance on initDataUnsafe on backend.
+
+required_patterns:
+  - 'WebAppData'
+  - 'HMAC|hmac'
+  - 'SHA[- ]?256|sha256'
+  - 'auth_date'
+  - 'JWT|jwt'
+  - 'initData'
+  - 'FastAPI|aiohttp'
+  - 'React|Vite|@twa-dev/sdk'
+
+forbidden_patterns:
+  - 'trust.*initDataUnsafe'
+  - "CORS.*\"\\*\"|cors_origins.*\\*"
+
+min_code_blocks: 3

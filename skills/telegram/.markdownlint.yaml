@@ -1,0 +1,11 @@
+default: true
+# Allow long lines (code samples, tables)
+MD013: false
+# Allow inline HTML (needed for some formatting)
+MD033: false
+# Allow duplicate headings across sections
+MD024: { siblings_only: true }
+# First line doesn't need to be h1 (frontmatter files)
+MD041: false
+# Allow emphasis as heading (we use it in rules)
+MD036: false

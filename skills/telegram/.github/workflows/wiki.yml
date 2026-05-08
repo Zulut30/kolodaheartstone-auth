@@ -1,0 +1,44 @@
+name: wiki
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'wiki/**'
+      - '.github/workflows/wiki.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check wiki page count
+        id: pages
+        run: |
+          count=$(find wiki -maxdepth 1 -name '*.md' \
+            ! -name 'README.md' | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Found $count wiki pages."
+
+      - name: Sync wiki to <repo>.wiki.git
+        uses: Andrew-Chen-Wang/github-wiki-action@v4
+        with:
+          path: wiki/
+          token: ${{ secrets.GITHUB_TOKEN }}
+          strategy: clone
+          ignore: |
+            README.md
+            publish_wiki.sh
+
+      - name: Summary
+        run: |
+          echo "## Wiki sync complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pages synced: ${{ steps.pages.outputs.count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Visit: https://github.com/${{ github.repository }}/wiki" >> "$GITHUB_STEP_SUMMARY"

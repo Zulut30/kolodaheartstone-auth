@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels: [dependencies, ci]
+
+  - package-ecosystem: "pip"
+    directory: "/examples/01-vip-media-bot"
+    schedule:
+      interval: "weekly"
+    labels: [dependencies, example]
+    open-pull-requests-limit: 5
+    groups:
+      aiogram-stack:
+        patterns: ["aiogram*", "aiohttp"]
+      sqlalchemy-stack:
+        patterns: ["sqlalchemy*", "alembic", "asyncpg"]
+      dev-tools:
+        patterns: ["ruff", "mypy", "pytest*"]
+
+  - package-ecosystem: "docker"
+    directory: "/examples/01-vip-media-bot/docker"
+    schedule:
+      interval: "monthly"
+    labels: [dependencies, docker]

@@ -1,0 +1,12 @@
+{
+  "files.associations": {
+    "*.mdc": "markdown"
+  },
+  "markdown.extension.toc.levels": "2..4",
+  "editor.rulers": [100],
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.rulers": [100]
+  },
+  "python.analysis.typeCheckingMode": "strict"
+}

@@ -1,0 +1,60 @@
+{
+  "BotForge: new bot request": {
+    "scope": "markdown,plaintext",
+    "prefix": "bf-new",
+    "body": [
+      "BotForge: ${1|Lite,Pro,Media,SaaS|}",
+      "Задача: ${2:краткое описание продукта}",
+      "Ограничения: ${3:бюджет / хостинг / сроки}",
+      "",
+      "Ответы на брифинг:",
+      "1) purpose: ${4:content / sales / VIP / support / AI / other}",
+      "2) monetization: ${5:free / Stars / ЮKassa / CryptoBot / Stripe / mixed}",
+      "3) audience: ${6:100 / 10k / 100k+}",
+      "4) integrations: ${7:Sheets / WordPress / OpenAI / CRM / none}",
+      "5) hosting: ${8|VPS,Fly.io,Railway,Docker,serverless|}"
+    ],
+    "description": "Structured BotForge new-bot request"
+  },
+  "BotForge: extend feature": {
+    "scope": "markdown,plaintext",
+    "prefix": "bf-extend",
+    "body": [
+      "BotForge: extend",
+      "Задача: добавь ${1:описание фичи}",
+      "Ограничения: сохранить обратную совместимость с текущим публичным API сервисов."
+    ]
+  },
+  "BotForge: review": {
+    "scope": "markdown,plaintext",
+    "prefix": "bf-review",
+    "body": [
+      "BotForge: review",
+      "",
+      "```python",
+      "${1:code}",
+      "```"
+    ]
+  },
+  "BotForge: Mini App": {
+    "scope": "markdown,plaintext",
+    "prefix": "bf-miniapp",
+    "body": [
+      "BotForge: Pro",
+      "Подключи Telegram Mini App.",
+      "UI: ${1:каталог / dashboard / личный кабинет}.",
+      "Frontend stack: ${2|React + Vite,Vue + Vite,Svelte,vanilla TS|}.",
+      "Backend: FastAPI + JWT + initData HMAC validation."
+    ]
+  },
+  "BotForge: payments": {
+    "scope": "markdown,plaintext",
+    "prefix": "bf-pay",
+    "body": [
+      "BotForge: payments",
+      "Провайдер: ${1|stars,yookassa,cryptobot,stripe,tribute|}",
+      "Продукт: ${2:VIP-доступ / разовая покупка / подписка}",
+      "Сумма: ${3:100} ${4|XTR,RUB,USD,USDT|}"
+    ]
+  }
+}

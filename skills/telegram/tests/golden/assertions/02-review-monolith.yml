@@ -1,0 +1,18 @@
+name: Review must flag all blocker-level issues
+description: |
+  The skill must catch: hardcoded token, SQL injection via f-string, blocking
+  `requests`, business logic in handler, missing structure. Uses
+  [blocker]/[major]/[minor]/[nit] tagging.
+
+contains_sections: []
+
+required_patterns:
+  - '\[blocker\]'
+  - 'requests'                # flagged as blocking
+  - 'BOT_TOKEN|token'          # hardcoded token
+  - 'SQL|f-string|injection|f"'  # SQL injection
+  - 'handler|services|repositor'   # structure critique
+
+forbidden_patterns: []
+
+min_code_blocks: 0

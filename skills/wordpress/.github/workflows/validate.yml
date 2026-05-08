@@ -1,0 +1,107 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate skill package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install npm dependencies
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+
+      - name: Composer validate
+        run: composer validate
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: PHP syntax lint
+        run: npm run lint:php
+
+      - name: PHPCS readiness check
+        continue-on-error: true
+        run: composer run lint
+
+      - name: Validate skill
+        run: npm run validate:skill
+
+      - name: Smoke test
+        run: npm run smoke
+
+      - name: Performance audit fixture
+        shell: bash
+        run: |
+          npm run performance:audit
+          npm run --silent performance:audit:json > performance-audit-output.json
+          node -e "JSON.parse(require('fs').readFileSync('performance-audit-output.json', 'utf8')); console.log('Performance audit JSON parsed.')"
+
+      - name: Design audit fixture
+        shell: bash
+        run: |
+          npm run design:audit
+          npm run --silent design:audit:json > design-audit-output.json
+          node -e "JSON.parse(require('fs').readFileSync('design-audit-output.json', 'utf8')); console.log('Design audit JSON parsed.')"
+
+      - name: Compatibility audit fixture
+        shell: bash
+        run: |
+          npm run compatibility:audit
+          npm run --silent compatibility:audit:json > compatibility-audit-output.json
+          node -e "JSON.parse(require('fs').readFileSync('compatibility-audit-output.json', 'utf8')); console.log('Compatibility audit JSON parsed.')"
+
+      - name: Audit sample fixture
+        shell: bash
+        run: |
+          if [ ! -d test-fixtures/sample-plugin ]; then
+            echo "No test-fixtures/sample-plugin directory found; skipping fixture audit."
+            exit 0
+          fi
+
+          set +e
+          node skills/wordpress-plugin-dev/scripts/audit-plugin.mjs test-fixtures/sample-plugin > audit-output.txt
+          status=$?
+          set -e
+
+          cat audit-output.txt
+
+          if ! grep -q "unsafe-example.php" audit-output.txt; then
+            echo "Expected fixture finding for unsafe-example.php was not reported."
+            exit 1
+          fi
+
+          if [ "$status" -ne 1 ]; then
+            echo "Expected audit exit code 1 for intentionally unsafe fixture, got $status."
+            exit 1
+          fi
+
+          echo "Sample fixture audit produced expected findings."
+
+      - name: Build release package
+        run: npm run package:skill

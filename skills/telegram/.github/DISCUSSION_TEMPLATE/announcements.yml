@@ -1,0 +1,18 @@
+title: "[Announcement] "
+labels: ["announcement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Post a release announcement, roadmap update, or major news.
+  - type: textarea
+    id: body
+    attributes:
+      label: Announcement
+      description: What's happening?
+      placeholder: |
+        ## What's new
+
+        ## Why it matters
+
+        ## Links

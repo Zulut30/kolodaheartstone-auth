@@ -1,0 +1,13 @@
+BotForge: Pro
+
+Задача: VIP-бот для Telegram-канала о кино.
+Gated-контент через проверку подписки на канал.
+VIP-доступ за 100 Stars/мес.
+Админка: статистика + рассылки.
+
+Ответы на брифинг:
+1) purpose: content / gated access / VIP subscription
+2) monetization: Telegram Stars (100 XTR / 30 days)
+3) audience: до 10k MAU
+4) integrations: только Telegram API
+5) hosting: VPS, Docker Compose, webhook
