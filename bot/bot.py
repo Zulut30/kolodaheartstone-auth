@@ -63,6 +63,7 @@ LOCKERS_CACHE_TTL = 300.0
 IMAGE_FETCH_UA = "Mozilla/5.0 (compatible; KolodaHearthstoneBot/1.0)"
 IMAGE_FETCH_TIMEOUT = 20.0
 PREFETCH_CONCURRENCY = 8
+REFRESH_INTERVAL_SEC = int(env("REFRESH_INTERVAL_SEC", "1800", required=False))  # 30 min default
 PHOTO_CACHE_FILE = DATA_DIR / "photo_cache.json"
 
 logging.basicConfig(
@@ -771,6 +772,9 @@ async def main() -> None:
     ])
 
     asyncio.create_task(_warmup())
+    if REFRESH_INTERVAL_SEC > 0:
+        log.info("periodic refresh enabled: every %ds", REFRESH_INTERVAL_SEC)
+        asyncio.create_task(_periodic_refresh())
 
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -783,6 +787,41 @@ async def _warmup() -> None:
         await _prefetch_image_bytes()
     except Exception:
         log.exception("warmup failed")
+
+
+def _drop_orphan_bytes() -> None:
+    """Remove in-memory image bytes for URLs no longer in the catalog."""
+    if not SHARED_LOCKERS:
+        return
+    keep = {l["image"] for l in SHARED_LOCKERS if l.get("image")}
+    dropped = [u for u in IMAGE_BYTES if u not in keep]
+    for u in dropped:
+        IMAGE_BYTES.pop(u, None)
+    if dropped:
+        log.info("dropped %d orphan image bytes", len(dropped))
+
+
+async def _periodic_refresh() -> None:
+    """Re-pull /lockers on a schedule and pre-cache covers of any new posts."""
+    while True:
+        try:
+            await asyncio.sleep(REFRESH_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            break
+        try:
+            before = len(SHARED_LOCKERS)
+            before_imgs = len(IMAGE_BYTES) + len(PHOTO_CACHE)
+            await get_lockers(force=True)
+            await _prefetch_image_bytes()
+            _drop_orphan_bytes()
+            after = len(SHARED_LOCKERS)
+            after_imgs = len(IMAGE_BYTES) + len(PHOTO_CACHE)
+            log.info(
+                "periodic refresh: lockers %d -> %d, covers cached %d -> %d",
+                before, after, before_imgs, after_imgs,
+            )
+        except Exception:
+            log.exception("periodic refresh failed")
 
 
 if __name__ == "__main__":
