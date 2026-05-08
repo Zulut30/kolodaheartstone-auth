@@ -117,15 +117,40 @@ function svl_bot_collect_lockers() {
 }
 
 /**
- * Returns a public image URL for the post: featured image -> first <img> in
- * content -> empty string. The 'large' size keeps Telegram captions snappy.
+ * Public image URL for the post. Cascade of fallbacks so every locker has
+ * a cover, branded if the post itself has none.
  */
 function svl_bot_pick_image($post) {
+    // 1. Featured image (large)
     $url = get_the_post_thumbnail_url($post->ID, 'large');
     if ($url) return (string) $url;
-    if (preg_match('/<img[^>]+src=(["\'])([^"\']+)\1/i', $post->post_content, $im)) {
+
+    // 2. SEO modules' OG image (this plugin's own SEO module + AIOSEO + Yoast)
+    foreach (array('_vip_seo_og_image', '_aioseo_og_image_custom_url', '_yoast_wpseo_opengraph-image') as $meta_key) {
+        $val = get_post_meta($post->ID, $meta_key, true);
+        if (!empty($val)) return (string) $val;
+    }
+
+    // 3. First <img> embedded in the post body
+    if (preg_match('/<img[^>]+src=(["\'])([^"\']+)\1/i', (string) $post->post_content, $im)) {
         return (string) $im[2];
     }
+
+    // 4. Site-wide brand fallback: wallpaper.* shipped with the plugin
+    $dir  = plugin_dir_path(__FILE__);
+    $base = plugin_dir_url(__FILE__);
+    foreach (array('jpg', 'jpeg', 'png', 'webp', 'gif') as $ext) {
+        if (file_exists($dir . 'wallpaper.' . $ext)) {
+            return $base . 'wallpaper.' . $ext;
+        }
+    }
+
+    // 5. Site icon as last resort
+    if (function_exists('get_site_icon_url')) {
+        $icon = get_site_icon_url(512);
+        if ($icon) return (string) $icon;
+    }
+
     return '';
 }
 
