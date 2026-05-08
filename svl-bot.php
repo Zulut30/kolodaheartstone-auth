@@ -254,8 +254,8 @@ function svl_bot_admin_page() {
                 <tr>
                     <th><label for="svl_bot_secret">Секрет</label></th>
                     <td>
-                        <input type="text" id="svl_bot_secret" name="<?php echo esc_attr(SVL_BOT_OPT_SECRET); ?>" value="<?php echo esc_attr($secret); ?>" class="large-text code" readonly onclick="this.select()">
-                        <p class="description">Бот шлёт его в заголовке <code>Authorization: Bearer ...</code>. Без секрета REST-эндпоинты возвращают 503.</p>
+                        <input type="text" id="svl_bot_secret" name="<?php echo esc_attr(SVL_BOT_OPT_SECRET); ?>" value="<?php echo esc_attr($secret); ?>" class="large-text code" autocomplete="off" spellcheck="false" onclick="this.select()" placeholder="Вставьте секрет, который зашит в боте, или нажмите «Перегенерировать»">
+                        <p class="description">Бот шлёт его в заголовке <code>Authorization: Bearer ...</code>. Без секрета REST-эндпоинты возвращают 503. После сохранения нажмите на поле — выделится для копирования.</p>
                     </td>
                 </tr>
                 <tr>
