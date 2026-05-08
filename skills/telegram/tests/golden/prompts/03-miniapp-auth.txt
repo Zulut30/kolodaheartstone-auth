@@ -1,4 +1,0 @@
-BotForge: Pro
-
-Подключи Mini App к существующему боту. Нужна авторизация через initData с JWT.
-Frontend — React + Vite.

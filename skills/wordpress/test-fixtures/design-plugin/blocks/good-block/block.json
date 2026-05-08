@@ -1,9 +1,0 @@
-{
-  "$schema": "https://schemas.wp.org/trunk/block.json",
-  "apiVersion": 3,
-  "name": "design-fixture/good-block",
-  "title": "Good Design Fixture Block",
-  "category": "widgets",
-  "textdomain": "design-fixture",
-  "editorScript": "file:./edit.js"
-}
