@@ -1,6 +1,8 @@
 services:
   bot:
-    build: ./bot
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
     container_name: kha-vip-bot
     restart: unless-stopped
     env_file: ./bot/.env

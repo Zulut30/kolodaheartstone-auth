@@ -69,6 +69,10 @@ PREFETCH_CONCURRENCY = 8
 REFRESH_INTERVAL_SEC = int(env("REFRESH_INTERVAL_SEC", "1800", required=False))
 PHOTO_CACHE_FILE = DATA_DIR / "photo_cache.json"
 
+BANNER_FILE = Path(__file__).parent / "banner.jpg"
+BANNER_CACHE_KEY = "__bundled_banner__"
+BANNER_BYTES: bytes | None = None
+
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 logging.basicConfig(
@@ -373,14 +377,58 @@ SUBSCRIBE_LEGACY_BUTTONS = parse_subscribe_links()
 #  Welcome / subscribe screens
 # =====================================================
 
-async def _first_cover_url() -> str:
+def _load_banner() -> None:
+    global BANNER_BYTES
+    try:
+        if BANNER_FILE.exists():
+            BANNER_BYTES = BANNER_FILE.read_bytes()
+            log.info("banner loaded: %d bytes", len(BANNER_BYTES))
+        else:
+            log.info("banner file not found: %s", BANNER_FILE)
+    except Exception:
+        log.exception("banner load failed")
+
+
+async def send_branded(
+    msg: Message,
+    caption: str,
+    kb: InlineKeyboardMarkup | None,
+) -> None:
+    """Send caption with the bundled banner; if banner unavailable, fall
+    back to first article cover; finally, plain text. Used for welcome /
+    subscribe / post-check screens — the catalog uses per-article images."""
+    file_id = PHOTO_CACHE.get(BANNER_CACHE_KEY)
+    if file_id:
+        try:
+            sent = await msg.answer_photo(file_id, caption=caption, reply_markup=kb)
+            _store_file_id(BANNER_CACHE_KEY, sent)
+            return
+        except TelegramBadRequest as e:
+            log.warning("banner file_id failed: %s", e.message)
+            PHOTO_CACHE.pop(BANNER_CACHE_KEY, None)
+            _save_photo_cache()
+
+    if BANNER_BYTES:
+        try:
+            input_file = BufferedInputFile(BANNER_BYTES, filename="banner.jpg")
+            sent = await msg.answer_photo(input_file, caption=caption, reply_markup=kb)
+            _store_file_id(BANNER_CACHE_KEY, sent)
+            return
+        except TelegramBadRequest as e:
+            log.warning("banner upload failed: %s", e.message)
+
+    cover = ""
     try:
         for l in await get_lockers():
             if l.get("image"):
-                return str(l["image"])
+                cover = str(l["image"])
+                break
     except Exception:
         log.exception("first cover lookup failed")
-    return ""
+    if cover and await send_photo_cached(msg, cover, caption, kb):
+        return
+
+    await msg.answer(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
 
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
@@ -392,11 +440,7 @@ def welcome_keyboard() -> InlineKeyboardMarkup:
 
 
 async def send_welcome_screen(msg: Message) -> None:
-    kb = welcome_keyboard()
-    cover = await _first_cover_url()
-    if cover and await send_photo_cached(msg, cover, WELCOME_TEXT, kb):
-        return
-    await msg.answer(WELCOME_TEXT, reply_markup=kb, link_preview_options=NO_PREVIEW)
+    await send_branded(msg, WELCOME_TEXT, welcome_keyboard())
 
 
 def subscribe_caption() -> str:
@@ -446,12 +490,7 @@ def subscribe_keyboard() -> InlineKeyboardMarkup:
 
 
 async def send_subscribe_screen(msg: Message) -> None:
-    caption = subscribe_caption()
-    kb = subscribe_keyboard()
-    cover = await _first_cover_url()
-    if cover and await send_photo_cached(msg, cover, caption, kb):
-        return
-    await msg.answer(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
+    await send_branded(msg, subscribe_caption(), subscribe_keyboard())
 
 
 # =====================================================
@@ -835,6 +874,7 @@ async def main() -> None:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     _load_photo_cache()
+    _load_banner()
 
     http_client = httpx.AsyncClient(
         base_url=WP_BASE_URL,
