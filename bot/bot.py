@@ -17,6 +17,7 @@ import html
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -503,30 +504,32 @@ def _truncate(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
-def _progress_bar(idx: int, total: int, length: int = 12) -> str:
-    if total <= 1:
-        return "▰" * length
-    filled = round((idx / (total - 1)) * length)
-    filled = max(0, min(length, filled))
-    return "▰" * filled + "▱" * (length - filled)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _first_sentences(text: str, n: int = 2) -> str:
+    """Return up to the first n sentences from text, preserving punctuation."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    parts = _SENTENCE_SPLIT_RE.split(text, maxsplit=n)
+    keep = parts[:n]
+    return " ".join(p.strip() for p in keep if p.strip())
 
 
 def card_caption(item: dict[str, Any], idx: int, total: int) -> str:
     title = _truncate((item.get("title") or "(без названия)").strip(), 200)
-    excerpt = (item.get("excerpt") or "").strip()
-    bar = _progress_bar(idx, total)
+    excerpt = _first_sentences(item.get("excerpt") or "", n=2)
 
-    head_plain = f"{title}\n📖 Статья {idx + 1} из {total}\n{bar}"
     head_html = (
         f"<b>{html.escape(title)}</b>\n"
-        f"<i>📖 Статья {idx + 1} из {total}</i>\n"
-        f"<code>{bar}</code>"
+        f"<i>📖 Статья {idx + 1} из {total}</i>"
     )
-
     if not excerpt:
         return head_html
 
-    body_budget = max(0, CAPTION_LIMIT - len(head_plain) - 50)
+    head_plain_len = len(title) + len(f"\n📖 Статья {idx + 1} из {total}")
+    body_budget = max(0, CAPTION_LIMIT - head_plain_len - 50)
     excerpt = _truncate(excerpt, body_budget)
     return f"{head_html}\n\n{html.escape(excerpt)}"
 
