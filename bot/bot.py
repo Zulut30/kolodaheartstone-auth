@@ -2,19 +2,17 @@
 Telegram bot for kolodahearthstone.ru VIP content unlock.
 
 Why we upload image bytes ourselves instead of passing URLs to Telegram:
-the WP host blocks/throttles Telegram's downloader (sendPhoto with the raw
-URL succeeds for ~13% of images and takes ~2s on average). So the bot
-fetches each cover with a normal browser User-Agent and uploads the bytes
-once. Telegram returns a file_id, we cache it on disk, and from then on
-every render is essentially instant.
+the WP host (Wordfence/hotlink) blocks ~85% of sendPhoto-by-URL attempts
+and is slow on the rest. The bot fetches each cover with a normal browser
+User-Agent and uploads the bytes once. Telegram returns a file_id, which
+we cache to disk; from then on every render is essentially instant.
 
-Caches (all keyed by image URL):
+Caches (keyed by image URL):
   PHOTO_CACHE   url -> file_id   (persisted to /data/photo_cache.json)
-  IMAGE_BYTES   url -> bytes     (in memory, populated by prefetch / on demand)
-
-Lockers list is fetched from WP once per ~5 min and shared across users.
+  IMAGE_BYTES   url -> bytes     (in memory; populated by prefetch / on-demand)
 """
 import asyncio
+import contextlib
 import html
 import json
 import logging
@@ -37,6 +35,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    LinkPreviewOptions,
     Message,
 )
 
@@ -53,8 +52,12 @@ WP_BASE_URL = env("WP_BASE_URL").rstrip("/")
 WP_BEARER = env("WP_BEARER")
 CHANNEL_ID = int(env("CHANNEL_ID"))
 GROUP_ID = int(env("GROUP_ID"))
-SUBSCRIBE_LINKS = env("SUBSCRIBE_LINKS", "", required=False)
 HTTP_TIMEOUT = float(env("HTTP_TIMEOUT", "10", required=False))
+
+BOOSTY_URL = env("BOOSTY_URL", "", required=False).strip()
+TRIBUTE_URL = env("TRIBUTE_URL", "", required=False).strip()
+SUBSCRIBE_LINKS = env("SUBSCRIBE_LINKS", "", required=False)  # legacy fallback
+
 DATA_DIR = Path(env("DATA_DIR", "/data", required=False))
 
 CAPTION_LIMIT = 1024
@@ -63,8 +66,10 @@ LOCKERS_CACHE_TTL = 300.0
 IMAGE_FETCH_UA = "Mozilla/5.0 (compatible; KolodaHearthstoneBot/1.0)"
 IMAGE_FETCH_TIMEOUT = 20.0
 PREFETCH_CONCURRENCY = 8
-REFRESH_INTERVAL_SEC = int(env("REFRESH_INTERVAL_SEC", "1800", required=False))  # 30 min default
+REFRESH_INTERVAL_SEC = int(env("REFRESH_INTERVAL_SEC", "1800", required=False))
 PHOTO_CACHE_FILE = DATA_DIR / "photo_cache.json"
+
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,9 +87,13 @@ SHARED_LOCKERS_LOCK: asyncio.Lock | None = None
 
 SUB_CACHE: dict[int, tuple[bool, float]] = {}
 
-PHOTO_CACHE: dict[str, str] = {}              # url -> file_id (persisted)
-IMAGE_BYTES: dict[str, bytes] = {}            # url -> bytes (in memory)
+PHOTO_CACHE: dict[str, str] = {}
+IMAGE_BYTES: dict[str, bytes] = {}
 IMAGE_FETCH_LOCKS: dict[str, asyncio.Lock] = {}
+
+# Shared, pooled HTTP client for WP — saves the TLS handshake on every call.
+http_client: httpx.AsyncClient | None = None
+IMAGE_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 ALLOWED_STATUSES = {"member", "administrator", "creator"}
 
@@ -156,24 +165,17 @@ async def is_subscribed(user_id: int, *, force: bool = False) -> bool:
 
 
 async def wp_get(path: str) -> Any:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(
-            f"{WP_BASE_URL}{path}",
-            headers={"Authorization": f"Bearer {WP_BEARER}"},
-        )
-        r.raise_for_status()
-        return r.json()
+    assert http_client is not None
+    r = await http_client.get(path)
+    r.raise_for_status()
+    return r.json()
 
 
 async def wp_post(path: str, payload: dict) -> Any:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.post(
-            f"{WP_BASE_URL}{path}",
-            headers={"Authorization": f"Bearer {WP_BEARER}"},
-            json=payload,
-        )
-        r.raise_for_status()
-        return r.json()
+    assert http_client is not None
+    r = await http_client.post(path, json=payload)
+    r.raise_for_status()
+    return r.json()
 
 
 async def get_lockers(*, force: bool = False) -> list[dict[str, Any]]:
@@ -205,25 +207,21 @@ async def _fetch_image_bytes(url: str) -> bytes | None:
     async with lock:
         if url in IMAGE_BYTES:
             return IMAGE_BYTES[url]
+        assert IMAGE_HTTP_CLIENT is not None
         try:
-            async with httpx.AsyncClient(
-                timeout=IMAGE_FETCH_TIMEOUT,
-                follow_redirects=True,
-                headers={"User-Agent": IMAGE_FETCH_UA},
-            ) as client:
-                r = await client.get(url)
-            if r.status_code != 200:
-                log.warning("image fetch %s: %d", url, r.status_code)
-                return None
-            ctype = r.headers.get("content-type", "")
-            if "image" not in ctype.lower():
-                log.warning("image fetch %s: non-image content-type=%s", url, ctype)
-                return None
-            IMAGE_BYTES[url] = r.content
-            return r.content
+            r = await IMAGE_HTTP_CLIENT.get(url)
         except Exception as e:
             log.warning("image fetch %s: err=%s", url, e)
             return None
+        if r.status_code != 200:
+            log.warning("image fetch %s: %d", url, r.status_code)
+            return None
+        ctype = r.headers.get("content-type", "")
+        if "image" not in ctype.lower():
+            log.warning("image fetch %s: non-image content-type=%s", url, ctype)
+            return None
+        IMAGE_BYTES[url] = r.content
+        return r.content
 
 
 def _filename_from_url(url: str) -> str:
@@ -234,20 +232,12 @@ def _filename_from_url(url: str) -> str:
 
 
 async def _photo_payload(url: str) -> tuple[Any, str] | tuple[None, None]:
-    """
-    Returns (payload, kind) where kind is one of 'file_id' / 'bytes'.
-    Tries cached file_id first, then locally cached bytes, then on-demand fetch.
-    """
     file_id = PHOTO_CACHE.get(url)
     if file_id:
         return file_id, "file_id"
-
-    img_bytes = IMAGE_BYTES.get(url)
-    if img_bytes is None:
-        img_bytes = await _fetch_image_bytes(url)
+    img_bytes = IMAGE_BYTES.get(url) or await _fetch_image_bytes(url)
     if img_bytes:
         return BufferedInputFile(img_bytes, filename=_filename_from_url(url)), "bytes"
-
     return None, None
 
 
@@ -267,7 +257,6 @@ async def send_photo_cached(
 ) -> bool:
     if not image_url:
         return False
-
     payload, kind = await _photo_payload(image_url)
     if payload is None:
         return False
@@ -300,7 +289,6 @@ async def edit_to_photo_cached(
 ) -> bool:
     if not image_url:
         return False
-
     payload, kind = await _photo_payload(image_url)
     if payload is None:
         return False
@@ -342,8 +330,7 @@ async def edit_to_photo_cached(
 WELCOME_TEXT = (
     "✨ <b>VIP-доступ Колоды Hearthstone</b>\n\n"
     "Этот бот выдаёт одноразовые ссылки разблокировки статей сайта "
-    "<a href=\"https://kolodahearthstone.ru\">kolodahearthstone.ru</a> "
-    "для подписчиков канала и группы.\n\n"
+    "<a href=\"https://kolodahearthstone.ru\">kolodahearthstone.ru</a>.\n\n"
     "🃏 Выбираете статью\n"
     "🔓 Получаете персональную ссылку\n"
     "💎 Открываете в браузере — доступ сохраняется на 7 дней"
@@ -352,9 +339,9 @@ WELCOME_TEXT = (
 HELP_TEXT = (
     "<b>Как это работает</b>\n\n"
     "1. Бот проверяет вашу подписку на канал и группу.\n"
-    "2. Вы выбираете статью в каталоге — бот выдаёт одноразовую ссылку.\n"
+    "2. Вы выбираете статью — бот выдаёт одноразовую ссылку.\n"
     "3. Открываете её <i>в обычном браузере</i> — ссылка автоматически разблокирует контент и сжигается.\n"
-    "4. Доступ к статье сохраняется в браузере на 7 дней.\n\n"
+    "4. Доступ сохраняется в браузере на 7 дней.\n\n"
     "<b>⚠️ Важно</b>\n"
     "Открывайте ссылку в системном браузере (Safari, Chrome, Edge), а не во встроенном Telegram-просмотрщике — "
     "иначе cookie разблокировки сохранится только в нём.\n\n"
@@ -373,21 +360,28 @@ def parse_subscribe_links() -> list[tuple[str, str]]:
             continue
         if "|" in entry:
             name, _, url = entry.partition("|")
-            name, url = name.strip(), url.strip()
+            items.append((name.strip(), url.strip()))
         else:
-            url = entry
-            name = "Подписаться"
-        if url:
-            items.append((name, url))
-    return items
+            items.append(("Подписаться", entry))
+    return [x for x in items if x[1]]
 
 
-SUBSCRIBE_BUTTONS = parse_subscribe_links()
+SUBSCRIBE_LEGACY_BUTTONS = parse_subscribe_links()
 
 
 # =====================================================
-#  Welcome / subscribe
+#  Welcome / subscribe screens
 # =====================================================
+
+async def _first_cover_url() -> str:
+    try:
+        for l in await get_lockers():
+            if l.get("image"):
+                return str(l["image"])
+    except Exception:
+        log.exception("first cover lookup failed")
+    return ""
+
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -398,37 +392,66 @@ def welcome_keyboard() -> InlineKeyboardMarkup:
 
 
 async def send_welcome_screen(msg: Message) -> None:
-    cover_url = ""
-    try:
-        lockers = await get_lockers()
-        for l in lockers:
-            if l.get("image"):
-                cover_url = l["image"]
-                break
-    except Exception:
-        log.exception("welcome: get_lockers failed")
-
     kb = welcome_keyboard()
-    if cover_url and await send_photo_cached(msg, cover_url, WELCOME_TEXT, kb):
+    cover = await _first_cover_url()
+    if cover and await send_photo_cached(msg, cover, WELCOME_TEXT, kb):
         return
-    await msg.answer(WELCOME_TEXT, reply_markup=kb, disable_web_page_preview=True)
+    await msg.answer(WELCOME_TEXT, reply_markup=kb, link_preview_options=NO_PREVIEW)
+
+
+def subscribe_caption() -> str:
+    parts = [
+        "🔒 <b>Премиум-доступ Колоды Hearthstone</b>",
+        "",
+        "Гайды, тир-листы, мета-отчёты и колоды для всех режимов "
+        "доступны подписчикам. Выберите удобный способ оформления:",
+        "",
+    ]
+    if BOOSTY_URL:
+        parts.append(
+            "<blockquote>🧡 <b>Boosty</b>\n"
+            "Карты (Visa / Mastercard / МИР), СБП.\n"
+            "Поддержка автора и всего сообщества.</blockquote>"
+        )
+    if TRIBUTE_URL:
+        parts.append(
+            "<blockquote>⭐ <b>Tribute</b>\n"
+            "Оплата прямо в Telegram через Telegram Stars.\n"
+            "Активация моментальная.</blockquote>"
+        )
+    parts.append(
+        "После оплаты вы попадёте в наш канал и группу — "
+        "бот автоматически даст вам доступ к материалам. "
+        "Вернитесь сюда и нажмите <b>«Я подписался»</b>."
+    )
+    return "\n".join(parts)
+
+
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    pay_row: list[InlineKeyboardButton] = []
+    if BOOSTY_URL:
+        pay_row.append(InlineKeyboardButton(text="🧡 Boosty", url=BOOSTY_URL))
+    if TRIBUTE_URL:
+        pay_row.append(InlineKeyboardButton(text="⭐ Tribute", url=TRIBUTE_URL))
+    if pay_row:
+        rows.append(pay_row)
+
+    for name, url in SUBSCRIBE_LEGACY_BUTTONS:
+        rows.append([InlineKeyboardButton(text=f"➡️ {name}", url=url)])
+
+    rows.append([InlineKeyboardButton(text="✅ Я подписался — проверить", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def send_subscribe_screen(msg: Message) -> None:
-    text = (
-        "🔒 <b>Доступ только для подписчиков</b>\n\n"
-        "Чтобы получить VIP-ссылки, вступите в наш канал или группу. "
-        "Затем нажмите <b>«Я подписался»</b> — проверим заново."
-    )
-    rows: list[list[InlineKeyboardButton]] = []
-    for name, url in SUBSCRIBE_BUTTONS:
-        rows.append([InlineKeyboardButton(text=f"➡️ {name}", url=url)])
-    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
-    await msg.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        disable_web_page_preview=True,
-    )
+    caption = subscribe_caption()
+    kb = subscribe_keyboard()
+    cover = await _first_cover_url()
+    if cover and await send_photo_cached(msg, cover, caption, kb):
+        return
+    await msg.answer(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
 
 
 # =====================================================
@@ -441,12 +464,25 @@ def _truncate(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+def _progress_bar(idx: int, total: int, length: int = 12) -> str:
+    if total <= 1:
+        return "▰" * length
+    filled = round((idx / (total - 1)) * length)
+    filled = max(0, min(length, filled))
+    return "▰" * filled + "▱" * (length - filled)
+
+
 def card_caption(item: dict[str, Any], idx: int, total: int) -> str:
     title = _truncate((item.get("title") or "(без названия)").strip(), 200)
     excerpt = (item.get("excerpt") or "").strip()
+    bar = _progress_bar(idx, total)
 
-    head_plain = f"{title}\n📖 Статья {idx + 1} из {total}"
-    head_html = f"<b>{html.escape(title)}</b>\n<i>📖 Статья {idx + 1} из {total}</i>"
+    head_plain = f"{title}\n📖 Статья {idx + 1} из {total}\n{bar}"
+    head_html = (
+        f"<b>{html.escape(title)}</b>\n"
+        f"<i>📖 Статья {idx + 1} из {total}</i>\n"
+        f"<code>{bar}</code>"
+    )
 
     if not excerpt:
         return head_html
@@ -488,27 +524,23 @@ async def render_card(
     if not edit:
         if image and await send_photo_cached(msg, image, caption, kb):
             return
-        await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
+        await msg.answer(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
         return
 
     is_photo_msg = bool(getattr(msg, "photo", None))
 
     if image and not is_photo_msg:
-        try:
+        with contextlib.suppress(TelegramBadRequest):
             await msg.delete()
-        except TelegramBadRequest:
-            pass
         if await send_photo_cached(msg, image, caption, kb):
             return
-        await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
+        await msg.answer(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
         return
 
     if not image and is_photo_msg:
-        try:
+        with contextlib.suppress(TelegramBadRequest):
             await msg.delete()
-        except TelegramBadRequest:
-            pass
-        await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
+        await msg.answer(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
         return
 
     if image:
@@ -516,20 +548,18 @@ async def render_card(
             return
     else:
         try:
-            await msg.edit_text(caption, reply_markup=kb, disable_web_page_preview=True)
+            await msg.edit_text(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
             return
         except TelegramBadRequest as e:
             if _is_not_modified(e):
                 return
             log.info("edit_text failed: %s", e.message)
 
-    try:
+    with contextlib.suppress(TelegramBadRequest):
         await msg.delete()
-    except TelegramBadRequest:
-        pass
     if image and await send_photo_cached(msg, image, caption, kb):
         return
-    await msg.answer(caption, reply_markup=kb, disable_web_page_preview=True)
+    await msg.answer(caption, reply_markup=kb, link_preview_options=NO_PREVIEW)
 
 
 # =====================================================
@@ -572,18 +602,19 @@ async def issue_link_for(q: CallbackQuery, item: dict[str, Any], idx: int) -> No
 
     open_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Открыть в браузере", url=url)],
-        [InlineKeyboardButton(text="📚 Назад в каталог", callback_data=f"catalog:{idx}")],
+        [InlineKeyboardButton(text="⬅️ Назад в каталог", callback_data=f"catalog:{idx}")],
     ])
     text = (
-        f"🔓 <b>{html.escape(title)}</b>\n\n"
-        f"⏱ Действует <b>{minutes} мин</b> · одноразовая\n"
-        f"💎 После активации доступ сохранится в браузере на 7 дней\n\n"
-        f"<b>Ссылка</b> (нажмите, чтобы скопировать):\n"
+        f"🎉 <b>Доступ выдан</b>\n\n"
+        f"🃏 {html.escape(title)}\n\n"
+        f"<blockquote>⏱ Действует <b>{minutes} мин</b> · одноразовая\n"
+        f"💎 После активации доступ сохранится в браузере на 7 дней</blockquote>\n"
+        f"<b>Ваша ссылка</b> (нажмите, чтобы скопировать):\n"
         f"<code>{html.escape(url)}</code>\n\n"
         f"<i>💡 Откройте её в обычном браузере (Safari, Chrome, Edge). "
-        f"Если открыть встроенным просмотрщиком Telegram — cookie сохранится только в нём.</i>"
+        f"Во встроенном Telegram-просмотрщике cookie не сохранится.</i>"
     )
-    await q.message.answer(text, reply_markup=open_kb, disable_web_page_preview=True)
+    await q.message.answer(text, reply_markup=open_kb, link_preview_options=NO_PREVIEW)
 
 
 # =====================================================
@@ -607,15 +638,20 @@ async def cmd_catalog(msg: Message) -> None:
     await open_catalog(msg, idx=0, edit_message=None)
 
 
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(msg: Message) -> None:
+    await send_subscribe_screen(msg)
+
+
 @dp.message(Command("help"))
 async def cmd_help(msg: Message) -> None:
-    await msg.answer(HELP_TEXT, disable_web_page_preview=True)
+    await msg.answer(HELP_TEXT, link_preview_options=NO_PREVIEW)
 
 
 @dp.callback_query(F.data == "help")
 async def cb_help(q: CallbackQuery) -> None:
     await q.answer()
-    await q.message.answer(HELP_TEXT, disable_web_page_preview=True)
+    await q.message.answer(HELP_TEXT, link_preview_options=NO_PREVIEW)
 
 
 @dp.callback_query(F.data == "noop")
@@ -628,10 +664,8 @@ async def cb_check_sub(q: CallbackQuery) -> None:
     SUB_CACHE.pop(q.from_user.id, None)
     if await is_subscribed(q.from_user.id, force=True):
         await q.answer("✅ Подписка подтверждена")
-        try:
+        with contextlib.suppress(TelegramBadRequest):
             await q.message.delete()
-        except TelegramBadRequest:
-            pass
         await send_welcome_screen(q.message)
     else:
         await q.answer(
@@ -647,7 +681,7 @@ async def cb_refresh(q: CallbackQuery) -> None:
         return
     await q.answer("Обновляю каталог…")
     await get_lockers(force=True)
-    asyncio.create_task(_prefetch_image_bytes())  # fire-and-forget refresh
+    asyncio.create_task(_prefetch_image_bytes())
     await open_catalog(q.message, idx=0, edit_message=q.message)
 
 
@@ -697,7 +731,7 @@ async def open_catalog(
     if not lockers:
         await msg.answer(
             "📭 Пока нет VIP-статей.\nЗагляните позже — авторы публикуют новые материалы регулярно.",
-            disable_web_page_preview=True,
+            link_preview_options=NO_PREVIEW,
         )
         return
 
@@ -737,11 +771,10 @@ async def _prefetch_image_bytes() -> None:
     if not urls:
         log.info(
             "image prefetch: %d cached as file_id, %d in memory — nothing to fetch",
-            len([1 for l in lockers if l.get("image") in PHOTO_CACHE]),
-            len([1 for l in lockers if l.get("image") in IMAGE_BYTES]),
+            sum(1 for l in lockers if l.get("image") in PHOTO_CACHE),
+            sum(1 for l in lockers if l.get("image") in IMAGE_BYTES),
         )
         return
-
     log.info("image prefetch: %d to fetch", len(urls))
     sem = asyncio.Semaphore(PREFETCH_CONCURRENCY)
 
@@ -754,43 +787,7 @@ async def _prefetch_image_bytes() -> None:
     log.info("image prefetch done: %d/%d bytes ready", ok, len(urls))
 
 
-async def main() -> None:
-    global SHARED_LOCKERS_LOCK
-    SHARED_LOCKERS_LOCK = asyncio.Lock()
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _load_photo_cache()
-
-    me = await bot.get_me()
-    log.info("starting bot @%s id=%s data=%s", me.username, me.id, DATA_DIR)
-    log.info("WP base: %s", WP_BASE_URL)
-
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="catalog", description="Каталог VIP-статей"),
-        BotCommand(command="help", description="Помощь"),
-    ])
-
-    asyncio.create_task(_warmup())
-    if REFRESH_INTERVAL_SEC > 0:
-        log.info("periodic refresh enabled: every %ds", REFRESH_INTERVAL_SEC)
-        asyncio.create_task(_periodic_refresh())
-
-    await bot.delete_webhook(drop_pending_updates=False)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-
-async def _warmup() -> None:
-    try:
-        await get_lockers(force=True)
-        log.info("lockers warmup: %d cached", len(SHARED_LOCKERS))
-        await _prefetch_image_bytes()
-    except Exception:
-        log.exception("warmup failed")
-
-
 def _drop_orphan_bytes() -> None:
-    """Remove in-memory image bytes for URLs no longer in the catalog."""
     if not SHARED_LOCKERS:
         return
     keep = {l["image"] for l in SHARED_LOCKERS if l.get("image")}
@@ -802,7 +799,6 @@ def _drop_orphan_bytes() -> None:
 
 
 async def _periodic_refresh() -> None:
-    """Re-pull /lockers on a schedule and pre-cache covers of any new posts."""
     while True:
         try:
             await asyncio.sleep(REFRESH_INTERVAL_SEC)
@@ -822,6 +818,65 @@ async def _periodic_refresh() -> None:
             )
         except Exception:
             log.exception("periodic refresh failed")
+
+
+async def _warmup() -> None:
+    try:
+        await get_lockers(force=True)
+        log.info("lockers warmup: %d cached", len(SHARED_LOCKERS))
+        await _prefetch_image_bytes()
+    except Exception:
+        log.exception("warmup failed")
+
+
+async def main() -> None:
+    global SHARED_LOCKERS_LOCK, http_client, IMAGE_HTTP_CLIENT
+    SHARED_LOCKERS_LOCK = asyncio.Lock()
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _load_photo_cache()
+
+    http_client = httpx.AsyncClient(
+        base_url=WP_BASE_URL,
+        timeout=HTTP_TIMEOUT,
+        headers={"Authorization": f"Bearer {WP_BEARER}"},
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+    )
+    IMAGE_HTTP_CLIENT = httpx.AsyncClient(
+        timeout=IMAGE_FETCH_TIMEOUT,
+        headers={"User-Agent": IMAGE_FETCH_UA},
+        follow_redirects=True,
+        limits=httpx.Limits(max_keepalive_connections=PREFETCH_CONCURRENCY, max_connections=20),
+    )
+
+    try:
+        me = await bot.get_me()
+        log.info("starting bot @%s id=%s data=%s", me.username, me.id, DATA_DIR)
+        log.info("WP base: %s", WP_BASE_URL)
+        log.info(
+            "providers: boosty=%s tribute=%s legacy=%d",
+            "yes" if BOOSTY_URL else "no",
+            "yes" if TRIBUTE_URL else "no",
+            len(SUBSCRIBE_LEGACY_BUTTONS),
+        )
+
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="catalog", description="Каталог VIP-статей"),
+            BotCommand(command="subscribe", description="Оформить подписку"),
+            BotCommand(command="help", description="Помощь"),
+        ])
+
+        asyncio.create_task(_warmup())
+        if REFRESH_INTERVAL_SEC > 0:
+            log.info("periodic refresh enabled: every %ds", REFRESH_INTERVAL_SEC)
+            asyncio.create_task(_periodic_refresh())
+
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await http_client.aclose()
+        await IMAGE_HTTP_CLIENT.aclose()
 
 
 if __name__ == "__main__":
