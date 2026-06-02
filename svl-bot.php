@@ -49,6 +49,11 @@ function svl_bot_register_routes() {
         'callback'            => 'svl_bot_rest_redeem',
         'permission_callback' => '__return_true',
     ));
+    register_rest_route('vip/v1', '/redeem/(?P<kha>[A-Za-z0-9_-]+)/(?P<post_id>[0-9]+)', array(
+        'methods'             => 'GET',
+        'callback'            => 'svl_bot_rest_redeem',
+        'permission_callback' => '__return_true',
+    ));
 }
 
 function svl_bot_check_bearer($request) {
@@ -242,10 +247,7 @@ function svl_bot_rest_issue($request) {
     }
 
     $base = ($post_id > 0) ? get_permalink($post_id) : home_url('/');
-    $url = add_query_arg(array_filter(array(
-        'token'   => $token,
-        'post_id' => $post_id > 0 ? $post_id : null,
-    )), rest_url('vip/v1/redeem'));
+    $url = rest_url('vip/v1/redeem/' . rawurlencode($token) . '/' . max(0, $post_id));
 
     return rest_ensure_response(array(
         'token'      => $token,
@@ -266,18 +268,21 @@ function svl_bot_rest_issue($request) {
  * bot link can reliably set the cookie and then redirect to the article.
  */
 function svl_bot_rest_redeem($request) {
-    $token = sanitize_text_field((string) ($request->get_param('token') ?: $request->get_param('vip_token')));
+    $token = svl_bot_read_redeem_token($request);
     $post_id = intval($request->get_param('post_id'));
 
     if (!preg_match('/^[a-f0-9]{32}$/', $token)) {
         svl_bot_set_cookie('vip_magic_status', 'invalid', time() + 60);
-        return svl_bot_redirect_response($post_id > 0 ? get_permalink($post_id) : home_url('/'));
+        return svl_bot_redirect_response(
+            $post_id > 0 ? get_permalink($post_id) : home_url('/'),
+            'bad-format-len-' . strlen($token) . '-' . substr(preg_replace('/[^A-Za-z0-9_-]/', '_', $token), 0, 16)
+        );
     }
 
-    $data = function_exists('svl_magic_lookup_token') ? svl_magic_lookup_token($token) : false;
+    $data = svl_bot_lookup_token($token);
     if (!$data || empty($data['code'])) {
         svl_bot_set_cookie('vip_magic_status', 'invalid', time() + 60);
-        return svl_bot_redirect_response($post_id > 0 ? get_permalink($post_id) : home_url('/'));
+        return svl_bot_redirect_response($post_id > 0 ? get_permalink($post_id) : home_url('/'), 'not-found');
     }
 
     $code = trim((string) $data['code']);
@@ -292,9 +297,7 @@ function svl_bot_rest_redeem($request) {
     svl_bot_set_cookie($cookie_name, 'true', $expires);
     svl_bot_set_cookie('vip_magic_status', 'success', time() + 60);
 
-    if (function_exists('svl_magic_burn_token')) {
-        svl_magic_burn_token($token);
-    }
+    svl_bot_burn_token($token);
 
     if (function_exists('svl_pro_log')) {
         svl_pro_log(array(
@@ -311,7 +314,35 @@ function svl_bot_rest_redeem($request) {
     update_option('svl_locker_stats', $stats, false);
 
     $target = $post_id > 0 ? get_permalink($post_id) : home_url('/');
-    return svl_bot_redirect_response($target);
+    return svl_bot_redirect_response($target, 'success');
+}
+
+function svl_bot_read_redeem_token($request) {
+    $url_params = method_exists($request, 'get_url_params') ? $request->get_url_params() : array();
+    foreach (array('kha', 'v', 'svl_token', 'vip_token', 'token') as $key) {
+        if (isset($url_params[$key])) {
+            $value = sanitize_text_field((string) $url_params[$key]);
+            if ($value !== '') return $value;
+        }
+    }
+
+    $query = method_exists($request, 'get_query_params') ? $request->get_query_params() : array();
+    foreach (array('kha', 'v', 'svl_token', 'vip_token', 'token') as $key) {
+        $value = null;
+        if (isset($query[$key])) {
+            $value = $query[$key];
+        } elseif (isset($_GET[$key])) {
+            $value = wp_unslash($_GET[$key]);
+        }
+        if (is_array($value)) {
+            $value = reset($value);
+        }
+        $value = sanitize_text_field((string) $value);
+        if ($value !== '') {
+            return $value;
+        }
+    }
+    return '';
 }
 
 function svl_bot_set_cookie($name, $value, $expires) {
@@ -329,13 +360,54 @@ function svl_bot_set_cookie($name, $value, $expires) {
     $_COOKIE[$name] = $value;
 }
 
-function svl_bot_redirect_response($url) {
+function svl_bot_redirect_response($url, $status = '') {
     $fallback = home_url('/');
     $target = wp_validate_redirect((string) $url, $fallback);
     $response = new WP_REST_Response(null, 302);
     $response->header('Location', $target);
     $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    $response->header('X-SVL-Bot-Version', 'redeem-direct-db-20260602');
+    if ($status !== '') {
+        $response->header('X-SVL-Redeem', $status);
+    }
     return $response;
+}
+
+function svl_bot_get_magic_tokens_direct() {
+    global $wpdb;
+    $raw = $wpdb->get_var($wpdb->prepare(
+        "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+        'svl_magic_tokens'
+    ));
+    if ($raw === null) return array();
+    $arr = maybe_unserialize($raw);
+    return is_array($arr) ? $arr : array();
+}
+
+function svl_bot_save_magic_tokens_direct($arr) {
+    if (!is_array($arr)) $arr = array();
+    update_option('svl_magic_tokens', $arr, false);
+    wp_cache_delete('svl_magic_tokens', 'options');
+    wp_cache_delete('alloptions', 'options');
+}
+
+function svl_bot_lookup_token($token) {
+    if (!preg_match('/^[a-f0-9]{32}$/', $token)) return false;
+    $arr = svl_bot_get_magic_tokens_direct();
+    if (empty($arr[$token]) || !is_array($arr[$token])) return false;
+    $t = $arr[$token];
+    if (!empty($t['used_at'])) return false;
+    if (!empty($t['expires']) && intval($t['expires']) < time()) return false;
+    return $t;
+}
+
+function svl_bot_burn_token($token) {
+    $arr = svl_bot_get_magic_tokens_direct();
+    if (empty($arr[$token]) || !is_array($arr[$token])) return;
+    $arr[$token]['used_at'] = time();
+    $ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+    $arr[$token]['used_ip'] = mb_substr($ip, 0, 64);
+    svl_bot_save_magic_tokens_direct($arr);
 }
 
 /**
@@ -343,14 +415,11 @@ function svl_bot_redirect_response($url) {
  * The svl-magic.php redeem handler will pick it up on ?vip_token=... and burn it.
  */
 function svl_bot_create_token($code, $ttl_seconds, $note = '', $post_id = 0) {
-    if (!function_exists('svl_magic_get_all') || !function_exists('svl_magic_save_all') || !function_exists('svl_magic_generate_token')) {
-        return false;
-    }
     $code = trim((string) $code);
     if ($code === '') return false;
 
-    $arr   = svl_magic_get_all();
-    $token = svl_magic_generate_token();
+    $arr   = svl_bot_get_magic_tokens_direct();
+    $token = function_exists('svl_magic_generate_token') ? svl_magic_generate_token() : bin2hex(random_bytes(16));
     $arr[$token] = array(
         'code'    => $code,
         'created' => time(),
@@ -360,7 +429,7 @@ function svl_bot_create_token($code, $ttl_seconds, $note = '', $post_id = 0) {
         'post_id' => max(0, intval($post_id)),
         'note'    => mb_substr((string) $note, 0, 200),
     );
-    svl_magic_save_all($arr);
+    svl_bot_save_magic_tokens_direct($arr);
     return $token;
 }
 
