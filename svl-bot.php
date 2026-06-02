@@ -8,6 +8,7 @@
  *
  *   GET  /wp-json/vip/v1/lockers   -> list articles with [vip_locker] / svl/locker blocks
  *   POST /wp-json/vip/v1/issue     -> { post_id, code, telegram_user_id, ttl? } -> { url, token, expires_at }
+ *   GET  /wp-json/vip/v1/redeem    -> token redirect that sets the unlock cookie
  *
  * Admin page: VIP Locker → Telegram бот (bearer secret + stats).
  */
@@ -42,6 +43,11 @@ function svl_bot_register_routes() {
         'methods'             => 'POST',
         'callback'            => 'svl_bot_rest_issue',
         'permission_callback' => 'svl_bot_check_bearer',
+    ));
+    register_rest_route('vip/v1', '/redeem', array(
+        'methods'             => 'GET',
+        'callback'            => 'svl_bot_rest_redeem',
+        'permission_callback' => '__return_true',
     ));
 }
 
@@ -230,17 +236,21 @@ function svl_bot_rest_issue($request) {
     $ttl_default = max(60, intval(get_option(SVL_BOT_OPT_TTL, SVL_BOT_DEFAULT_TTL)));
     $ttl = $ttl_in > 0 ? max(60, min(86400, $ttl_in)) : $ttl_default;
 
-    $token = svl_bot_create_token($code, $ttl, 'tg-bot:' . $tg_user);
+    $token = svl_bot_create_token($code, $ttl, 'tg-bot:' . $tg_user, $post_id);
     if (!$token) {
         return new WP_Error('svl_bot_token', 'Token creation failed', array('status' => 500));
     }
 
     $base = ($post_id > 0) ? get_permalink($post_id) : home_url('/');
-    $url  = add_query_arg('vip_token', $token, $base);
+    $url = add_query_arg(array_filter(array(
+        'token'   => $token,
+        'post_id' => $post_id > 0 ? $post_id : null,
+    )), rest_url('vip/v1/redeem'));
 
     return rest_ensure_response(array(
         'token'      => $token,
         'url'        => $url,
+        'target'     => $base,
         'code'       => $code,
         'ttl'        => $ttl,
         'expires_at' => gmdate('c', time() + $ttl),
@@ -248,10 +258,91 @@ function svl_bot_rest_issue($request) {
 }
 
 /**
+ * Public token redemption endpoint.
+ *
+ * This intentionally does not rely on the front-end ?vip_token=... handler:
+ * full-page caches / reverse proxies can serve the post before WordPress gets
+ * a chance to run init hooks. REST requests bypass that page-cache path, so the
+ * bot link can reliably set the cookie and then redirect to the article.
+ */
+function svl_bot_rest_redeem($request) {
+    $token = sanitize_text_field((string) ($request->get_param('token') ?: $request->get_param('vip_token')));
+    $post_id = intval($request->get_param('post_id'));
+
+    if (!preg_match('/^[a-f0-9]{32}$/', $token)) {
+        svl_bot_set_cookie('vip_magic_status', 'invalid', time() + 60);
+        return svl_bot_redirect_response($post_id > 0 ? get_permalink($post_id) : home_url('/'));
+    }
+
+    $data = function_exists('svl_magic_lookup_token') ? svl_magic_lookup_token($token) : false;
+    if (!$data || empty($data['code'])) {
+        svl_bot_set_cookie('vip_magic_status', 'invalid', time() + 60);
+        return svl_bot_redirect_response($post_id > 0 ? get_permalink($post_id) : home_url('/'));
+    }
+
+    $code = trim((string) $data['code']);
+    if (!empty($data['post_id'])) {
+        $post_id = intval($data['post_id']);
+    }
+
+    $cookie_name = 'vip_access_' . preg_replace('/[^a-z0-9]/', '', strtolower($code));
+    $days = function_exists('svl_opt') ? intval(svl_opt('svl_cookie_days') ?: 7) : 7;
+    $expires = time() + max(1, $days) * DAY_IN_SECONDS;
+
+    svl_bot_set_cookie($cookie_name, 'true', $expires);
+    svl_bot_set_cookie('vip_magic_status', 'success', time() + 60);
+
+    if (function_exists('svl_magic_burn_token')) {
+        svl_magic_burn_token($token);
+    }
+
+    if (function_exists('svl_pro_log')) {
+        svl_pro_log(array(
+            'code'    => $code,
+            'post_id' => $post_id,
+            'referer' => 'telegram-bot',
+            'is_fail' => 0,
+        ));
+    }
+
+    $stats = get_option('svl_locker_stats', array());
+    if (!is_array($stats)) $stats = array();
+    $stats[$code] = isset($stats[$code]) ? intval($stats[$code]) + 1 : 1;
+    update_option('svl_locker_stats', $stats, false);
+
+    $target = $post_id > 0 ? get_permalink($post_id) : home_url('/');
+    return svl_bot_redirect_response($target);
+}
+
+function svl_bot_set_cookie($name, $value, $expires) {
+    $args = array(
+        'expires'  => intval($expires),
+        'path'     => '/',
+        'secure'   => is_ssl(),
+        'httponly' => false,
+        'samesite' => 'Lax',
+    );
+    if (defined('COOKIE_DOMAIN') && COOKIE_DOMAIN) {
+        $args['domain'] = COOKIE_DOMAIN;
+    }
+    setcookie($name, $value, $args);
+    $_COOKIE[$name] = $value;
+}
+
+function svl_bot_redirect_response($url) {
+    $fallback = home_url('/');
+    $target = wp_validate_redirect((string) $url, $fallback);
+    $response = new WP_REST_Response(null, 302);
+    $response->header('Location', $target);
+    $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    return $response;
+}
+
+/**
  * Writes a short-lived (seconds-based) token directly into svl_magic_tokens.
  * The svl-magic.php redeem handler will pick it up on ?vip_token=... and burn it.
  */
-function svl_bot_create_token($code, $ttl_seconds, $note = '') {
+function svl_bot_create_token($code, $ttl_seconds, $note = '', $post_id = 0) {
     if (!function_exists('svl_magic_get_all') || !function_exists('svl_magic_save_all') || !function_exists('svl_magic_generate_token')) {
         return false;
     }
@@ -266,6 +357,7 @@ function svl_bot_create_token($code, $ttl_seconds, $note = '') {
         'expires' => time() + max(60, intval($ttl_seconds)),
         'used_at' => 0,
         'used_ip' => '',
+        'post_id' => max(0, intval($post_id)),
         'note'    => mb_substr((string) $note, 0, 200),
     );
     svl_magic_save_all($arr);
